@@ -9,7 +9,14 @@ exports.getBatchAllotmentList = async (req, res) => {
   const isSuperAdmin = req.isSuperAdmin;
 
   try {
-    const { search = '', location_id, filter = 'all_pending' } = req.query;
+    // ✅ Extracting startDate and endDate for range filtering
+    const { 
+      search = '', 
+      location_id, 
+      filter = 'all_pending',
+      startDate,
+      endDate 
+    } = req.query;
 
     let query = supabase
       .from('v_admission_financial_summary')
@@ -37,20 +44,25 @@ exports.getBatchAllotmentList = async (req, res) => {
       query = query.eq('location_id', userLocationId);
     }
 
+    /* --- 📅 NEW: DATE RANGE FILTERING --- */
+    if (startDate) {
+      query = query.gte('date_of_admission', startDate);
+    }
+    if (endDate) {
+      query = query.lte('date_of_admission', endDate);
+    }
+
     /* --- 🔍 IMPROVED FILTER LOGIC --- */
-    // 1. Allotted but Not Joined: Batch array has items AND joined is false
     if (filter === 'allotted_not_joined') {
       query = query
         .not('batch_names', 'is', null)
-        .filter('batch_names', 'cs', '{}') // 'cs' (contains) ensures it's an array type
-        .neq('batch_names', '{}')          // Exclude empty arrays
+        .filter('batch_names', 'cs', '{}') 
+        .neq('batch_names', '{}')          
         .eq('joined', false);
     } 
-    // 2. Joined: Strictly those who have started
     else if (filter === 'joined') {
       query = query.eq('joined', true);
     } 
-    // 3. Pending: Default view (Not yet joined)
     else if (filter === 'all_pending') {
       query = query.eq('joined', false);
     }
@@ -87,6 +99,7 @@ exports.getBatchAllotmentList = async (req, res) => {
     res.status(500).json({ error: 'Failed to load batch allotment list' });
   }
 };
+
 /* ===========================================================
    UPDATE BATCH ALLOTMENT (CONTROLLER FIX)
    =========================================================== */
@@ -99,20 +112,30 @@ exports.updateBatchAllotment = async (req, res) => {
   const staffIdentifier = req.user?.username || 'System'; 
 
   try {
-    // ✅ SECURITY CHECK: Ensure the user belongs to the same branch or is super_admin
+    // ✅ STEP 1: Fetch details and check current batch allotment status
     const { data: targetAdmission, error: checkErr } = await supabase
-      .from('admissions')
-      .select('location_id')
-      .eq('id', admissionId)
+      .from('v_admission_financial_summary') // Using view to see batch_names easily
+      .select('location_id, batch_names')
+      .eq('admission_id', admissionId)
       .single();
 
     if (checkErr || !targetAdmission) return res.status(404).json({ error: "Admission not found." });
 
+    /* --- 🛡️ SECURITY CHECK --- */
     if (!isSuperAdmin && Number(targetAdmission.location_id) !== Number(locationId)) {
       return res.status(403).json({ error: "Unauthorized: You can only update students in your own branch." });
     }
 
-    // 1. Update main admission
+    /* --- 🚫 BATCH VALIDATION: Cannot mark Joined if no batches allotted --- */
+    const hasBatches = Array.isArray(targetAdmission.batch_names) && targetAdmission.batch_names.length > 0;
+    
+    if (joined === true && !hasBatches) {
+      return res.status(400).json({ 
+        error: "Validation Failed: Student cannot be marked as 'Joined' until at least one batch has been allotted." 
+      });
+    }
+
+    // 2. Update main admission
     const { error: admissionErr } = await supabase
       .from('admissions')
       .update({
@@ -124,7 +147,7 @@ exports.updateBatchAllotment = async (req, res) => {
 
     if (admissionErr) throw admissionErr;
 
-    // 2. Log History
+    // 3. Log History
     if (remarks && remarks.trim() !== "") {
       await supabase
         .from('admission_remarks')
@@ -141,7 +164,6 @@ exports.updateBatchAllotment = async (req, res) => {
     res.status(500).json({ error: 'Failed to update batch allotment' });
   }
 };
-
 
 exports.getRemarkHistory = async (req, res) => {
   const { admissionId } = req.params;
