@@ -5,19 +5,43 @@ const supabase = require("../db.js");
  * from start_date up to 'today' (or batch end_date).
  * Default schedule is Mon-Sat (1,2,3,4,5,6).
  */
-const getExpectedSessionDates = (startDate, endDate, scheduleDays = [1, 2, 3, 4, 5, 6]) => {
+/**
+ * RIGID HELPER: Generates class dates based strictly on the provided schedule.
+ * If scheduleDays is empty or missing, it returns NO dates (prevents false counting).
+ */
+const getExpectedSessionDates = (startDate, endDate, scheduleDays) => {
+  // 1. Safety check: If no schedule is provided, return empty (don't assume Mon-Sat)
+  if (!scheduleDays || !Array.isArray(scheduleDays) || scheduleDays.length === 0) {
+    return [];
+  }
+
   const dates = [];
+  
+  // 2. Normalize current and end boundaries to start of day (UTC/Local consistency)
   let current = new Date(startDate);
+  current.setHours(0, 0, 0, 0);
+
   const today = new Date();
-  const finalBoundary = new Date(endDate) > today ? today : new Date(endDate);
+  today.setHours(0, 0, 0, 0);
+
+  const batchEnd = new Date(endDate);
+  batchEnd.setHours(0, 0, 0, 0);
+
+  // We only count up to 'today' or the 'batch end', whichever comes first
+  const finalBoundary = batchEnd > today ? today : batchEnd;
+
+  // Convert scheduleDays to Numbers just in case they are strings from DB
+  const validDays = scheduleDays.map(Number);
 
   while (current <= finalBoundary) {
-    // 0 is Sunday, 1 is Monday...
-    if (scheduleDays.includes(current.getDay())) {
+    // getDay(): 0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat
+    if (validDays.includes(current.getDay())) {
       dates.push(current.toISOString().split('T')[0]);
     }
+    // Increment day safely
     current.setDate(current.getDate() + 1);
   }
+  
   return dates;
 };
 
