@@ -124,12 +124,6 @@ const getDailyAttendanceForBatch = async (req, res) => {
   }
 };
 
-/**
- * UPDATED: Returns a report including students with a specific remark hierarchy.
- * Priority: 
- * - If RVM: (Balance <= 0) ? 'FULL PAID' : (Next Date) ? formattedDate : student.remarks
- * - If Legacy: student.remarks
- */
 const getBatchAttendanceReport = async (req, res) => {
   const { batchId } = req.params;
   const { startDate, endDate } = req.query;
@@ -145,7 +139,6 @@ const getBatchAttendanceReport = async (req, res) => {
       { data: attendanceRecords, error: attendanceError }
     ] = await Promise.all([
       supabase.from('batches').select('start_date, end_date, schedule').eq('id', batchId).single(),
-      // ✅ Fetching via 'students' table bridge to avoid PGRST200 join errors
       supabase.from('batch_students')
         .select(`
           student_id,
@@ -169,33 +162,36 @@ const getBatchAttendanceReport = async (req, res) => {
     if (batchError || studentError || attendanceError) throw (batchError || studentError || attendanceError);
     if (!studentLinks || studentLinks.length === 0) return res.status(404).json({ error: 'No students found for this batch.' });
 
-    // Process students to apply the standardized hybrid logic
+    // 1. Generate strictly valid schedule dates
+    const expectedDates = typeof getExpectedSessionDates === 'function' 
+      ? getExpectedSessionDates(startDate, endDate, batchInfo.schedule)
+      : [];
+
+    // 2. Filter attendance records to ONLY include days that match the schedule
+    // This ignores "extra" logs marked on wrong days.
+    const validAttendanceRecords = attendanceRecords.filter(record => 
+      expectedDates.includes(record.date)
+    );
+
+    // 3. Process students (Logic remains same)
     const processedStudents = studentLinks.map(link => {
       const student = link.students;
       if (!student) return null;
-
       const admissionNo = (student.admission_number || "").trim();
       const followData = Array.isArray(student.follow_up) ? student.follow_up[0] : student.follow_up;
       const balance = followData ? Number(followData.total_due || 0) : 0;
       const nextDate = followData?.next_task_due_date;
       
       let dynamicRemark = '';
-
-      // ✅ LOGIC A: Modern Students (RVM-)
       if (admissionNo.startsWith('RVM-')) {
-        if (balance <= 0) {
-          dynamicRemark = 'FULL PAID';
-        } else if (nextDate) {
+        if (balance <= 0) dynamicRemark = 'FULL PAID';
+        else if (nextDate) {
           const d = new Date(nextDate);
           dynamicRemark = !isNaN(d.getTime()) 
             ? `${String(d.getDate()).padStart(2, '0')} ${d.toLocaleString('en-GB', { month: 'short' })} ${d.getFullYear()}`
             : 'Date Pending';
-        } else {
-          dynamicRemark = student.remarks || 'No Remark';
-        }
-      } 
-      // ✅ LOGIC B: Legacy Students (Numeric)
-      else {
+        } else dynamicRemark = student.remarks || 'No Remark';
+      } else {
         dynamicRemark = student.remarks || 'No Remark';
       }
 
@@ -210,14 +206,11 @@ const getBatchAttendanceReport = async (req, res) => {
       };
     }).filter(Boolean);
 
-    const markedDates = [...new Set(attendanceRecords.map(r => r.date))];
-    const expectedDates = typeof getExpectedSessionDates === 'function' 
-      ? getExpectedSessionDates(startDate, endDate, batchInfo.schedule || [1,2,3,4,5,6])
-      : [];
-      
+    // 4. Compliance Calculations using ONLY valid dates
+    const markedDates = [...new Set(validAttendanceRecords.map(r => r.date))];
     const missingDates = expectedDates.filter(d => !markedDates.includes(d));
 
-    const attendance_by_date = attendanceRecords.reduce((acc, record) => {
+    const attendance_by_date = validAttendanceRecords.reduce((acc, record) => {
       const dateKey = record.date;
       if (!acc[dateKey]) acc[dateKey] = [];
       acc[dateKey].push({ student_id: record.student_id, is_present: record.is_present });
@@ -230,7 +223,7 @@ const getBatchAttendanceReport = async (req, res) => {
       compliance: {
         missing_attendance_dates: missingDates,
         expected_days_count: expectedDates.length,
-        marked_days_count: markedDates.length
+        marked_days_count: markedDates.length // Now correctly reflects only valid schedule days
       }
     });
   } catch (error) {
