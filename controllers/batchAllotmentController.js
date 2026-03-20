@@ -9,7 +9,7 @@ exports.getBatchAllotmentList = async (req, res) => {
   const isSuperAdmin = req.isSuperAdmin;
 
   try {
-    // ✅ Extracting startDate and endDate for range filtering
+    // ✅ Extracting parameters; startDate/endDate now used for Joining Range
     const { 
       search = '', 
       location_id, 
@@ -44,12 +44,13 @@ exports.getBatchAllotmentList = async (req, res) => {
       query = query.eq('location_id', userLocationId);
     }
 
-    /* --- 📅 NEW: DATE RANGE FILTERING --- */
+    /* --- 📅 UPDATED: JOINING DATE RANGE FILTERING --- */
+    // Logic switched from date_of_admission to course_start_date
     if (startDate) {
-      query = query.gte('date_of_admission', startDate);
+      query = query.gte('course_start_date', startDate);
     }
     if (endDate) {
-      query = query.lte('date_of_admission', endDate);
+      query = query.lte('course_start_date', endDate);
     }
 
     /* --- 🔍 IMPROVED FILTER LOGIC --- */
@@ -72,7 +73,8 @@ exports.getBatchAllotmentList = async (req, res) => {
       query = query.or(`student_name.ilike.%${search}%,admission_number.ilike.%${search}%,student_phone_number.ilike.%${search}%`);
     }
 
-    const { data: admissions, error } = await query.order('date_of_admission', { ascending: false });
+    // Updated sorting to prioritize the Joining Date
+    const { data: admissions, error } = await query.order('course_start_date', { ascending: false });
 
     if (error) throw error;
     if (!admissions) return res.json([]);
