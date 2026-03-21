@@ -319,3 +319,45 @@ exports.checkAdmissionByPhone = async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 };
+
+// server/controllers/admissionController.js
+
+/**
+ * @description
+ * Toggle the undertaking status between Completed and Pending.
+ */
+exports.toggleUndertakingStatus = async (req, res) => {
+  const { id } = req.params;
+  const { completed } = req.body; // Expecting boolean true/false
+  const userId = req.user?.id;
+
+  try {
+    const statusText = completed ? 'Completed' : 'Pending';
+    
+    const { data, error } = await supabase
+      .from('admissions')
+      .update({ 
+        undertaking_completed: completed,
+        undertaking_status: statusText,
+        undertaking_completed_at: completed ? new Date() : null,
+        updated_at: new Date()
+      })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    // Log the change in remarks
+    await supabase.from('admission_remarks').insert([{
+      admission_id: id,
+      remark_text: `Undertaking status manually changed to: ${statusText}`,
+      created_by: userId
+    }]);
+
+    res.status(200).json({ message: `Undertaking marked as ${statusText}`, data });
+  } catch (error) {
+    console.error('Toggle Undertaking Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+};

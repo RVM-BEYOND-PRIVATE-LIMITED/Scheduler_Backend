@@ -23,5 +23,6 @@ router.put('/:id', auth, updateAdmission);
 
 // ✅ NEW: Route to mark a student as a Dropout
 router.put('/:id/dropout', auth, markStudentDropout);
+router.put('/:id/toggle-undertaking', auth, toggleUndertakingStatus);
 
 module.exports = router;
