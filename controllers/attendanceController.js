@@ -244,10 +244,6 @@ const getBatchAttendanceReport = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
-/**
- * UPDATED: Single Faculty Audit Report (Location & Role Aware)
- * Scopes data by branch for standard admins; global access for Super Admins.
- */
 const getFacultyAttendanceReport = async (req, res) => {
   const { facultyId } = req.params;
   const { startDate, endDate, location_id } = req.query; 
@@ -259,7 +255,6 @@ const getFacultyAttendanceReport = async (req, res) => {
   }
 
   try {
-    // 1. Fetch Faculty Data
     const { data: facultyData } = await supabase
       .from('faculty')
       .select('id, name')
@@ -268,7 +263,6 @@ const getFacultyAttendanceReport = async (req, res) => {
 
     if (!facultyData) return res.status(404).json({ error: "Faculty not found" });
 
-    /* -------------------- 🛡️ LOCATION LOGIC -------------------- */
     let targetLocationId = null;
     if (isSuperAdmin) {
       if (location_id && location_id !== 'all') targetLocationId = Number(location_id);
@@ -277,7 +271,6 @@ const getFacultyAttendanceReport = async (req, res) => {
       targetLocationId = userLocationId;
     }
 
-    // 2. Fetch involved batches
     let permBatchQuery = supabase.from('batches').select('id').eq('faculty_id', facultyId);
     if (targetLocationId) {
       permBatchQuery = permBatchQuery.eq('location_id', targetLocationId);
@@ -305,7 +298,6 @@ const getFacultyAttendanceReport = async (req, res) => {
       });
     }
 
-    // 3. Fetch Context Data
     const [allBatches, studentLinks, attendanceRecords, substitutions] = await Promise.all([
       supabase.from('batches').select('id, name, faculty_id, start_date, end_date, schedule').in('id', involvedBatchIds),
       supabase.from('batch_students').select('batch_id').in('batch_id', involvedBatchIds),
@@ -323,16 +315,13 @@ const getFacultyAttendanceReport = async (req, res) => {
 
     const batchReports = batchesToProcess.map(batch => {
       const studentCount = batchStudentCounts[batch.id] || 0;
-      
       const auditStart = new Date(startDate) > new Date(batch.start_date) ? startDate : batch.start_date;
       const auditEnd = new Date(endDate) < new Date(batch.end_date) ? endDate : batch.end_date;
       
-      // ✅ Get strictly valid schedule dates
       const expectedDates = getExpectedSessionDates(auditStart, auditEnd, batch.schedule);
       
       const relevantAttendance = attendanceRecords.data.filter(rec => {
         if (rec.batch_id !== batch.id) return false;
-        // Check if this specific date belongs to this faculty (handling substitutions)
         const sub = substitutions.data.find(s => s.batch_id === batch.id && rec.date >= s.start_date && rec.date <= s.end_date);
         const actingFacultyId = sub ? sub.substitute_faculty_id : batch.faculty_id;
         return actingFacultyId === facultyId;
@@ -340,9 +329,9 @@ const getFacultyAttendanceReport = async (req, res) => {
 
       const markedDates = [...new Set(relevantAttendance.map(a => a.date))];
       
-      // 🔥 RIGID MATH: Possible = Expected Days * Students
-      // Present = Actual Present count in relevant records
-      const batchPossible = expectedDates.length * studentCount;
+      // ✅ FIX: Protect against Division by Zero and Unscheduled classes
+      const sessionCountForMath = Math.max(expectedDates.length, markedDates.length);
+      const batchPossible = sessionCountForMath * studentCount;
       const actualPresentCount = relevantAttendance.filter(a => a.is_present).length;
       
       const missingDates = expectedDates.filter(d => !markedDates.includes(d));
@@ -387,7 +376,6 @@ const getFacultyAttendanceReport = async (req, res) => {
   }
 };
 
-
 const getOverallAttendanceReport = async (req, res) => {
   try {
     const { startDate, endDate, location_id } = req.query;
@@ -398,7 +386,6 @@ const getOverallAttendanceReport = async (req, res) => {
       return res.status(400).json({ error: "Start date and end date are required for the audit." });
     }
 
-    /* -------------------- 🛡️ LOCATION LOGIC -------------------- */
     let targetLocationId = null;
     if (isSuperAdmin) {
       if (location_id && !['all', 'All'].includes(location_id)) {
@@ -409,7 +396,6 @@ const getOverallAttendanceReport = async (req, res) => {
       targetLocationId = userLocationId;
     }
 
-    // 1. Fetch base data
     let facultyQuery = supabase.from("faculty").select("id, name, location_id");
     let batchQuery = supabase.from("batches").select("id, name, faculty_id, start_date, end_date, schedule, location_id");
 
@@ -430,7 +416,6 @@ const getOverallAttendanceReport = async (req, res) => {
 
     const activeBatchIds = activeBatches.map(b => b.id);
 
-    // 2. Fetch Audit Data
     const [substitutions, studentLinks, attendanceRecords] = await Promise.all([
         supabase.from("faculty_substitutions").select("*").in('batch_id', activeBatchIds),
         supabase.from("batch_students").select("batch_id").in('batch_id', activeBatchIds),
@@ -451,7 +436,6 @@ const getOverallAttendanceReport = async (req, res) => {
       [f.id]: { id: f.id, name: f.name, batchStats: {} } 
     }), {});
 
-    // 3. Process Marked Attendance
     (attendanceRecords.data || []).forEach(record => {
         const batchDetails = activeBatches.find(b => b.id === record.batch_id);
         if (!batchDetails) return;
@@ -474,7 +458,6 @@ const getOverallAttendanceReport = async (req, res) => {
     let globalTotalPresent = 0;
     let globalTotalPossible = 0;
 
-    // 4. 🔥 RIGID CALCULATION: Compare Expected vs Marked
     const facultyReports = Object.keys(facultyStats).map(fId => {
         const stats = facultyStats[fId];
         const missingLogs = [];
@@ -488,16 +471,15 @@ const getOverallAttendanceReport = async (req, res) => {
             const markedDates = Array.from(bData?.markedDates || []);
             const studentCount = batchStudentCounts[batch.id] || 0;
 
-            // Only audit if they are the primary faculty or they actually marked something (substitution)
             if (isPrimary || markedDates.length > 0) {
                 const auditStart = new Date(startDate) > new Date(batch.start_date) ? startDate : batch.start_date;
                 const auditEnd = new Date(endDate) < new Date(batch.end_date) ? endDate : batch.end_date;
                 
-                // Get strictly valid schedule dates
                 const expectedDates = getExpectedSessionDates(auditStart, auditEnd, batch.schedule);
                 
-                // RIGID MATH: Possible = Total Expected Sessions * Total Students
-                const batchPossible = expectedDates.length * studentCount;
+                // ✅ FIX: Use Math.max to prevent percentages over 100%
+                const sessionCountForMath = Math.max(expectedDates.length, markedDates.length);
+                const batchPossible = sessionCountForMath * studentCount;
                 const batchPresent = bData?.presentCount || 0;
 
                 facultyPresent += batchPresent;
