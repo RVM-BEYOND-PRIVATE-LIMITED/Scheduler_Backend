@@ -95,14 +95,23 @@ function getDynamicStatus(startDate, endDate) {
 const addOrUpdateAttendance = async (req, res) => {
   const { batchId, date, attendance } = req.body;
   try {
-    const formattedDate = date.substring(0, 10);
+    // ❌ OLD: date.substring(0, 10) or toISOString() 
+    // ✅ NEW: Extract the literal date without timezone conversion
+    const localDate = new Date(date);
+    const formattedDate = `${localDate.getFullYear()}-${String(localDate.getMonth() + 1).padStart(2, '0')}-${String(localDate.getDate()).padStart(2, '0')}`;
+
     const records = attendance.map(item => ({
       batch_id: batchId,
       student_id: item.student_id,
-      date: formattedDate,
+      date: formattedDate, // Now strictly YYYY-MM-DD in Local Time
       is_present: item.is_present,
     }));
-    const { data, error } = await supabase.from('student_attendance').upsert(records, { onConflict: ['batch_id', 'student_id', 'date'] }).select();
+
+    const { data, error } = await supabase
+      .from('student_attendance')
+      .upsert(records, { onConflict: ['batch_id', 'student_id', 'date'] })
+      .select();
+
     if (error) throw error;
     res.status(201).json(data);
   } catch (error) {
@@ -112,38 +121,50 @@ const addOrUpdateAttendance = async (req, res) => {
 
 const getDailyAttendanceForBatch = async (req, res) => {
   const { batchId } = req.params;
-  const { date } = req.query;
+  const { date } = req.query; // e.g., "2026-03-24T02:00:00.000Z"
+  
   if (!date) return res.status(400).json({ error: "A 'date' query parameter is required." });
 
   try {
-    const formattedDate = date.substring(0, 10);
+    // ✅ FIX: Force the date to remain in Local Time (IST) before extracting the string
+    const d = new Date(date);
+    const formattedDate = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 
     // Fetch existing attendance AND the batch student list
     const [attendanceRes, studentsRes] = await Promise.all([
-      supabase.from('student_attendance').select('*, student:students(*)').eq('batch_id', batchId).eq('date', formattedDate),
-      supabase.from('batch_students').select('student:students(*)').eq('batch_id', batchId)
+      supabase
+        .from('student_attendance')
+        .select('*, student:students(*)')
+        .eq('batch_id', batchId)
+        .eq('date', formattedDate),
+      supabase
+        .from('batch_students')
+        .select('student:students(*)')
+        .eq('batch_id', batchId)
     ]);
 
     if (attendanceRes.error) throw attendanceRes.error;
     if (studentsRes.error) throw studentsRes.error;
 
-    // If attendance exists in DB, return it
-    if (attendanceRes.data.length > 0) {
+    // 1. If attendance already exists in DB for this LOCAL date, return it
+    if (attendanceRes.data && attendanceRes.data.length > 0) {
       return res.status(200).json(attendanceRes.data);
     }
 
-    // 🔥 NEW RIGID LOGIC: If NO attendance is marked yet, return all students as "Absent" (false)
-    const defaultAttendance = studentsRes.data.map(link => ({
+    // 2. RIGID LOGIC: If NO attendance is marked yet, return all students as "Absent"
+    // This ensures the faculty starts with a clean "All Absent" slate for the correct day.
+    const defaultAttendance = (studentsRes.data || []).map(link => ({
       batch_id: batchId,
       student_id: link.student.id,
       date: formattedDate,
-      is_present: false, // Default to Absent
+      is_present: false, 
       student: link.student,
-      is_placeholder: true // Flag to tell frontend this isn't saved yet
+      is_placeholder: true 
     }));
 
     res.status(200).json(defaultAttendance);
   } catch (error) {
+    console.error("Daily Attendance Fetch Error:", error);
     res.status(500).json({ error: error.message });
   }
 };
@@ -386,6 +407,7 @@ const getOverallAttendanceReport = async (req, res) => {
       return res.status(400).json({ error: "Start date and end date are required for the audit." });
     }
 
+    /* -------------------- 🛡️ LOCATION LOGIC -------------------- */
     let targetLocationId = null;
     if (isSuperAdmin) {
       if (location_id && !['all', 'All'].includes(location_id)) {
@@ -396,6 +418,7 @@ const getOverallAttendanceReport = async (req, res) => {
       targetLocationId = userLocationId;
     }
 
+    // 1. Fetch base data
     let facultyQuery = supabase.from("faculty").select("id, name, location_id");
     let batchQuery = supabase.from("batches").select("id, name, faculty_id, start_date, end_date, schedule, location_id");
 
@@ -408,14 +431,33 @@ const getOverallAttendanceReport = async (req, res) => {
     const faculties = facultiesRes.data || [];
     const batchesData = batchesRes.data || [];
 
-    const activeBatches = batchesData.filter(b => getDynamicStatus(b.start_date, b.end_date) === "active");
+    /* -------------------- 🎯 RIGID SCHEDULE FILTER -------------------- */
+    // Filter batches to ONLY those that were supposed to run during the selected dates
+    const activeBatches = batchesData.filter(batch => {
+      const isStatusActive = getDynamicStatus(batch.start_date, batch.end_date) === "active";
+      if (!isStatusActive) return false;
+
+      // Check if this batch has any scheduled sessions within the user's selected range
+      const auditStart = new Date(startDate) > new Date(batch.start_date) ? startDate : batch.start_date;
+      const auditEnd = new Date(endDate) < new Date(batch.end_date) ? endDate : batch.end_date;
+      
+      const expectedDatesInRange = getExpectedSessionDates(auditStart, auditEnd, batch.schedule);
+      
+      // ✅ Only include if sessions were expected OR if they actually marked something (to capture extra classes)
+      return expectedDatesInRange.length > 0;
+    });
     
     if (activeBatches.length === 0) {
-      return res.json({ overall_attendance_percentage: 0, faculty_reports: [] });
+      return res.json({ 
+        overall_attendance_percentage: 0, 
+        faculty_reports: [],
+        message: "No batches were scheduled for the selected date range." 
+      });
     }
 
     const activeBatchIds = activeBatches.map(b => b.id);
 
+    // 2. Fetch Audit Data
     const [substitutions, studentLinks, attendanceRecords] = await Promise.all([
         supabase.from("faculty_substitutions").select("*").in('batch_id', activeBatchIds),
         supabase.from("batch_students").select("batch_id").in('batch_id', activeBatchIds),
@@ -436,6 +478,7 @@ const getOverallAttendanceReport = async (req, res) => {
       [f.id]: { id: f.id, name: f.name, batchStats: {} } 
     }), {});
 
+    // 3. Process Marked Attendance
     (attendanceRecords.data || []).forEach(record => {
         const batchDetails = activeBatches.find(b => b.id === record.batch_id);
         if (!batchDetails) return;
@@ -458,6 +501,7 @@ const getOverallAttendanceReport = async (req, res) => {
     let globalTotalPresent = 0;
     let globalTotalPossible = 0;
 
+    // 4. Generate Faculty Reports
     const facultyReports = Object.keys(facultyStats).map(fId => {
         const stats = facultyStats[fId];
         const missingLogs = [];
@@ -477,7 +521,7 @@ const getOverallAttendanceReport = async (req, res) => {
                 
                 const expectedDates = getExpectedSessionDates(auditStart, auditEnd, batch.schedule);
                 
-                // ✅ FIX: Use Math.max to prevent percentages over 100%
+                // ✅ FIX: Use Math.max to prevent percentages over 100% (Division by Zero Protection)
                 const sessionCountForMath = Math.max(expectedDates.length, markedDates.length);
                 const batchPossible = sessionCountForMath * studentCount;
                 const batchPresent = bData?.presentCount || 0;
@@ -518,11 +562,14 @@ const getOverallAttendanceReport = async (req, res) => {
         };
     });
 
+    // 5. Final Calculation
     res.status(200).json({ 
         overall_attendance_percentage: globalTotalPossible > 0 
             ? parseFloat(((globalTotalPresent / globalTotalPossible) * 100).toFixed(2)) 
             : 0,
-        faculty_reports: facultyReports.sort((a, b) => a.faculty_name.localeCompare(b.faculty_name))
+        faculty_reports: facultyReports
+          .filter(f => f.batches.length > 0) // Hide faculties with no classes today
+          .sort((a, b) => a.faculty_name.localeCompare(b.faculty_name))
     });
 
   } catch (error) {
@@ -530,6 +577,7 @@ const getOverallAttendanceReport = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
+
 
 module.exports = {
   addOrUpdateAttendance,
