@@ -23,30 +23,37 @@ router.delete('/:id', auth, deleteStudent);
 
 /**
  * GET /api/students/:id/defaulter
- * Fetches current defaulter status and reason.
+ * FIXED: Uses maybeSingle() to prevent 500 errors when no record is found.
  */
 router.get('/:id/defaulter', auth, async (req, res) => {
     try {
         const { data, error } = await supabase
             .from('students')
-            .select('is_defaulter, defaulter_reason')
+            .select('is_defaulter, defaulter_reason, admission_number')
             .eq('id', req.params.id)
-            .single();
+            .maybeSingle(); // ✅ Change .single() to .maybeSingle()
         
         if (error) throw error;
         
-        // Defensive check for null data
-        if (!data) return res.status(404).json({ error: "Student not found" });
+        // If data is null, the ID is wrong or doesn't exist in the students table
+        if (!data) {
+            return res.status(404).json({ 
+                error: "Student not found",
+                details: "The ID provided does not exist in the students table." 
+            });
+        }
 
         res.json({ 
             is_defaulter: !!data.is_defaulter, 
-            reason: data.defaulter_reason || "" 
+            reason: data.defaulter_reason || "",
+            has_admission_no: !!(data.admission_number && data.admission_number !== 'N/A')
         });
     } catch (err) {
         console.error("Error fetching defaulter status:", err.message);
-        res.status(500).json({ error: err.message });
-    }
+        res.status(500).json({ error: "Internal Server Error" });
+  }
 });
+
 
 /**
  * POST /api/students/:id/mark-defaulter
