@@ -215,14 +215,20 @@ const getStudentBatches = async (req, res) => {
  */
 const setDefaulterStatus = async (req, res) => {
   const { id } = req.params;
-  const is_defaulter = req.body.is_defaulter !== undefined ? req.body.is_defaulter : true;
+  const userId = req.user?.id;
+  
+  // ✅ Explicitly cast to boolean to satisfy the NOT NULL constraint in SQL
+  const is_defaulter = req.body.is_defaulter === false ? false : true;
   const { reason } = req.body;
 
   try {
-    const updateData = { is_defaulter };
+    const updateData = { 
+        is_defaulter,
+        updated_at: new Date() // Keeping timestamps in sync
+    };
 
     if (is_defaulter) {
-      updateData.defaulter_reason = reason || null;
+      updateData.defaulter_reason = reason || "No reason provided";
       updateData.defaulter_marked_at = new Date().toISOString();
     } else {
       updateData.defaulter_reason = null;
@@ -233,22 +239,38 @@ const setDefaulterStatus = async (req, res) => {
       .from('students')
       .update(updateData)
       .eq('id', id)
-      .select('id, is_defaulter, defaulter_reason')
-      .single();
+      .select('id, is_defaulter, name')
+      .maybeSingle();
 
-    if (error) throw error;
+    if (error) {
+      // 🕵️‍♂️ This will log the EXACT SQL error (e.g., RLS violation or constraint)
+      console.error("Supabase Database Error:", error.message, error.details);
+      return res.status(400).json({ error: error.message });
+    }
+
+    if (!data) {
+      return res.status(404).json({ error: "Student record not found." });
+    }
+
+    // ✅ Optional: Log the action in remarks for a paper trail
+    await supabase.from('admission_remarks').insert([{
+      admission_id: id, // Ensure this matches your student_id or admission_id logic
+      remark_text: is_defaulter 
+        ? `Marked as Defaulter. Reason: ${updateData.defaulter_reason}` 
+        : `Removed from Defaulter status.`,
+      created_by: userId
+    }]).maybeSingle();
 
     res.json({
       is_defaulter: data.is_defaulter,
-      reason: data.defaulter_reason,
-      message: is_defaulter ? "Marked as defaulter" : "Removed from defaulters"
+      message: is_defaulter ? "Student marked as defaulter" : "Defaulter status removed"
     });
+
   } catch (err) {
-    console.error("Defaulter update error:", err);
-    res.status(500).json({ error: "Failed to update defaulter status" });
+    console.error("Defaulter Controller Crash:", err);
+    res.status(500).json({ error: "Server encountered an error updating the record." });
   }
 };
-
 
 module.exports = {
   getAllStudents,
