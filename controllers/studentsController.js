@@ -215,64 +215,72 @@ const getStudentBatches = async (req, res) => {
  * RIGID RULE: Admission Number is COMPULSORY to mark as defaulter.
  */
 const setDefaulterStatus = async (req, res) => {
-  const { id } = req.params;
+  // ✅ 1. Trim the ID to remove hidden spaces/newlines
+  const id = req.params.id ? req.params.id.trim() : null;
   const is_marking_defaulter = req.body.is_defaulter === false ? false : true;
   const { reason } = req.body;
+  const userLocationId = req.locationId; // From your auth middleware
+  const isSuperAdmin = req.isSuperAdmin;
+
+  if (!id) return res.status(400).json({ error: "Student ID is required." });
 
   try {
-    // 1. Fetch the student first to verify they have an admission number
+    // 2. Fetch the student first - using .maybeSingle() to avoid 404 crashes
     const { data: student, error: fetchError } = await supabase
       .from('students')
-      .select('id, name, admission_number')
+      .select('id, name, admission_number, location_id')
       .eq('id', id)
-      .single();
+      .maybeSingle();
 
-    if (fetchError || !student) {
-      return res.status(404).json({ error: "Student record not found." });
+    if (fetchError) throw fetchError;
+
+    // 🕵️ DEBUG LOG: See exactly what the server found
+    if (!student) {
+      console.log(`404 DEBUG: No student found in DB for ID: [${id}]`);
+      return res.status(404).json({ error: "Student record not found in database." });
     }
 
-    // 2. 🔥 RIGID CHECK: Block if marking as defaulter without an Admission Number
+    // ✅ 3. Permission Check: Ensure Admin is in the right branch
+    if (!isSuperAdmin && student.location_id !== userLocationId) {
+       return res.status(403).json({ 
+         error: "Permission Denied", 
+         details: `Student belongs to location ${student.location_id}, but you are logged into ${userLocationId}` 
+       });
+    }
+
+    // ✅ 4. Compulsory Admission Number Check
     const admNo = (student.admission_number || "").trim();
     if (is_marking_defaulter && (!admNo || admNo === "" || admNo === "N/A")) {
       return res.status(400).json({ 
-        error: "Action Blocked: Student does not have a valid Admission Number.",
-        details: "Defaulter status can only be applied to fully enrolled students."
+        error: "Action Blocked: Student must have a valid Admission Number to be marked as a defaulter." 
       });
     }
 
-    // 3. Prepare Update Payload
+    // 5. Perform the Update
     const updateData = { 
         is_defaulter: is_marking_defaulter,
+        defaulter_reason: is_marking_defaulter ? (reason || "No reason provided") : null,
+        defaulter_marked_at: is_marking_defaulter ? new Date().toISOString() : null,
         updated_at: new Date()
     };
 
-    if (is_marking_defaulter) {
-      updateData.defaulter_reason = reason || "No reason provided";
-      updateData.defaulter_marked_at = new Date().toISOString();
-    } else {
-      updateData.defaulter_reason = null;
-      updateData.defaulter_marked_at = null;
-    }
-
-    // 4. Perform the Update
-    const { data: updatedStudent, error: updateError } = await supabase
+    const { data: updated, error: updateError } = await supabase
       .from('students')
       .update(updateData)
       .eq('id', id)
-      .select('id, is_defaulter, name')
+      .select()
       .single();
 
     if (updateError) throw updateError;
 
     res.json({
-      message: is_marking_defaulter ? "Student marked as defaulter" : "Status cleared",
-      student_name: updatedStudent.name,
-      is_defaulter: updatedStudent.is_defaulter
+      message: is_marking_defaulter ? "Marked as defaulter" : "Status cleared",
+      student_name: updated.name
     });
 
   } catch (err) {
-    console.error("Defaulter Logic Error:", err);
-    res.status(500).json({ error: "Server error during defaulter update." });
+    console.error("Defaulter Error:", err.message);
+    res.status(500).json({ error: err.message });
   }
 };
 
