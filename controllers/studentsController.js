@@ -212,22 +212,41 @@ const getStudentBatches = async (req, res) => {
 
 /**
  * Updates a student's defaulter status.
+ * RIGID RULE: Admission Number is COMPULSORY to mark as defaulter.
  */
 const setDefaulterStatus = async (req, res) => {
   const { id } = req.params;
-  const userId = req.user?.id;
-  
-  // ✅ Explicitly cast to boolean to satisfy the NOT NULL constraint in SQL
-  const is_defaulter = req.body.is_defaulter === false ? false : true;
+  const is_marking_defaulter = req.body.is_defaulter === false ? false : true;
   const { reason } = req.body;
 
   try {
+    // 1. Fetch the student first to verify they have an admission number
+    const { data: student, error: fetchError } = await supabase
+      .from('students')
+      .select('id, name, admission_number')
+      .eq('id', id)
+      .single();
+
+    if (fetchError || !student) {
+      return res.status(404).json({ error: "Student record not found." });
+    }
+
+    // 2. 🔥 RIGID CHECK: Block if marking as defaulter without an Admission Number
+    const admNo = (student.admission_number || "").trim();
+    if (is_marking_defaulter && (!admNo || admNo === "" || admNo === "N/A")) {
+      return res.status(400).json({ 
+        error: "Action Blocked: Student does not have a valid Admission Number.",
+        details: "Defaulter status can only be applied to fully enrolled students."
+      });
+    }
+
+    // 3. Prepare Update Payload
     const updateData = { 
-        is_defaulter,
-        updated_at: new Date() // Keeping timestamps in sync
+        is_defaulter: is_marking_defaulter,
+        updated_at: new Date()
     };
 
-    if (is_defaulter) {
+    if (is_marking_defaulter) {
       updateData.defaulter_reason = reason || "No reason provided";
       updateData.defaulter_marked_at = new Date().toISOString();
     } else {
@@ -235,40 +254,25 @@ const setDefaulterStatus = async (req, res) => {
       updateData.defaulter_marked_at = null;
     }
 
-    const { data, error } = await supabase
+    // 4. Perform the Update
+    const { data: updatedStudent, error: updateError } = await supabase
       .from('students')
       .update(updateData)
       .eq('id', id)
       .select('id, is_defaulter, name')
-      .maybeSingle();
+      .single();
 
-    if (error) {
-      // 🕵️‍♂️ This will log the EXACT SQL error (e.g., RLS violation or constraint)
-      console.error("Supabase Database Error:", error.message, error.details);
-      return res.status(400).json({ error: error.message });
-    }
-
-    if (!data) {
-      return res.status(404).json({ error: "Student record not found." });
-    }
-
-    // ✅ Optional: Log the action in remarks for a paper trail
-    await supabase.from('admission_remarks').insert([{
-      admission_id: id, // Ensure this matches your student_id or admission_id logic
-      remark_text: is_defaulter 
-        ? `Marked as Defaulter. Reason: ${updateData.defaulter_reason}` 
-        : `Removed from Defaulter status.`,
-      created_by: userId
-    }]).maybeSingle();
+    if (updateError) throw updateError;
 
     res.json({
-      is_defaulter: data.is_defaulter,
-      message: is_defaulter ? "Student marked as defaulter" : "Defaulter status removed"
+      message: is_marking_defaulter ? "Student marked as defaulter" : "Status cleared",
+      student_name: updatedStudent.name,
+      is_defaulter: updatedStudent.is_defaulter
     });
 
   } catch (err) {
-    console.error("Defaulter Controller Crash:", err);
-    res.status(500).json({ error: "Server encountered an error updating the record." });
+    console.error("Defaulter Logic Error:", err);
+    res.status(500).json({ error: "Server error during defaulter update." });
   }
 };
 
