@@ -425,50 +425,48 @@ const transformStudentData = (student) => {
 };
 
 const getBatchStudents = async (req, res) => {
-  const { id } = req.params;
+  const { id } = req.params; // batch_id
   try {
-    const allStudentLinks = [];
-    const pageSize = 1000;
-    let page = 0;
-    let moreDataAvailable = true;
+    const { data: studentLinks, error } = await supabase
+      .from('batch_students')
+      .select(`
+        student_id,
+        students:student_id (
+          *,
+          admission:admissions (
+            id,
+            batch_preference,
+            joined,
+            total_invoice_amount
+          ),
+          follow_up:v_follow_up_task_list (
+            next_task_due_date,
+            total_due,
+            task_count
+          ),
+          batch_count:batch_students(count)
+        )
+      `)
+      .eq('batch_id', id);
 
-    while (moreDataAvailable) {
-      const from = page * pageSize;
-      const to = from + pageSize - 1;
+    if (error) throw error;
 
-      /**
-       * ✅ Fetch from physical 'students' table to avoid PGRST200 join error.
-       * This uses the student_id foreign key bridge to the view.
-       */
-      const { data, error } = await supabase
-        .from('batch_students')
-        .select(`
-          student_id,
-          students:student_id (
-            *,
-            follow_up:v_follow_up_task_list (
-              next_task_due_date,
-              total_due,
-              task_count
-            )
-          )
-        `)
-        .eq('batch_id', id)
-        .range(from, to);
+    const processedStudents = studentLinks.map(item => {
+      const s = item.students;
+      if (!s) return null;
 
-      if (error) throw error;
-      if (data) allStudentLinks.push(...data);
+      // Use your existing transformer but add the new course/batch context
+      const transformed = transformStudentData(s); 
       
-      if (!data || data.length < pageSize) {
-        moreDataAvailable = false;
-      }
-      page++;
-    }
-
-    // Process students using the hybrid transformer logic
-    const processedStudents = allStudentLinks
-      .map(item => transformStudentData(item.students))
-      .filter(Boolean);
+      return {
+        ...transformed,
+        // ✅ NEW: Courses assigned in Admission (from batch_preference or courses table if joined)
+        enrolled_courses: s.admission?.[0]?.batch_preference || "N/A",
+        // ✅ NEW: Count of batches this student is currently in
+        active_batches_count: s.batch_count?.[0]?.count || 0,
+        admission_status: s.admission?.[0]?.joined ? "Joined" : "Pending"
+      };
+    }).filter(Boolean);
 
     res.json(processedStudents);
   } catch (error) {
