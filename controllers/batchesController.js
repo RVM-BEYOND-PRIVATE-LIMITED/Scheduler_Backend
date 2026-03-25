@@ -427,46 +427,71 @@ const transformStudentData = (student) => {
 const getBatchStudents = async (req, res) => {
   const { id } = req.params; // batch_id
   try {
-    const { data: studentLinks, error } = await supabase
+    // 1. Fetch the bridge links first to get all student IDs in this batch
+    const { data: links, error: linkError } = await supabase
       .from('batch_students')
-      .select(`
-        student_id,
-        students:student_id (
-          *,
-          admission:admissions (
-            id,
-            batch_preference,
-            joined,
-            total_invoice_amount
-          ),
-          follow_up:v_follow_up_task_list (
-            next_task_due_date,
-            total_due,
-            task_count
-          ),
-          batch_count:batch_students(count)
-        )
-      `)
+      .select('student_id')
       .eq('batch_id', id);
 
-    if (error) throw error;
+    if (linkError) throw linkError;
+    if (!links || links.length === 0) return res.json([]);
 
-    const processedStudents = studentLinks.map(item => {
-      const s = item.students;
-      if (!s) return null;
+    const studentIds = links.map(l => l.student_id);
 
-      // Use your existing transformer but add the new course/batch context
-      const transformed = transformStudentData(s); 
+    // 2. Fetch detailed student data from the financial summary view
+    // This view gives us 'courses_str' and 'student_id' directly.
+    const { data: viewData, error: viewError } = await supabase
+      .from('v_admission_financial_summary')
+      .select(`
+        student_id,
+        admission_number,
+        student_name,
+        student_phone_number,
+        courses_str,
+        certificate_name,
+        batch_preference,
+        balance_due,
+        next_task_due_date,
+        joined
+      `)
+      .in('student_id', studentIds);
+
+    if (viewError) throw viewError;
+
+    // 3. Fetch current batch counts for these students to help with planning
+    const { data: countData, error: countError } = await supabase
+      .from('batch_students')
+      .select('student_id')
+      .in('student_id', studentIds);
+
+    if (countError) throw countError;
+
+    // Helper to count occurrences of student_id in batch_students
+    const batchCounts = countData.reduce((acc, curr) => {
+      acc[curr.student_id] = (acc[curr.student_id] || 0) + 1;
+      return acc;
+    }, {});
+
+    // 4. Merge and Process
+    const processedStudents = viewData.map(student => {
+      // Logic for remarks/status often depends on balance_due
+      const isPaid = parseFloat(student.balance_due || 0) <= 0;
       
       return {
-        ...transformed,
-        // ✅ NEW: Courses assigned in Admission (from batch_preference or courses table if joined)
-        enrolled_courses: s.admission?.[0]?.batch_preference || "N/A",
-        // ✅ NEW: Count of batches this student is currently in
-        active_batches_count: s.batch_count?.[0]?.count || 0,
-        admission_status: s.admission?.[0]?.joined ? "Joined" : "Pending"
+        id: student.student_id,
+        name: student.student_name,
+        admission_number: student.admission_number,
+        phone_number: student.student_phone_number,
+        // ✅ Courses aggregated from admission_courses
+        enrolled_courses: student.courses_str || student.certificate_name || "N/A",
+        // ✅ Count of batches from our calculation above
+        active_batches_count: batchCounts[student.student_id] || 0,
+        // Use the view's data for the remark status logic
+        remarks: isPaid ? "FULL PAID" : `Due: ${student.balance_due}`,
+        is_defaulter: false, // You can join students table here if needed for this flag
+        next_follow_up: student.next_task_due_date
       };
-    }).filter(Boolean);
+    });
 
     res.json(processedStudents);
   } catch (error) {
