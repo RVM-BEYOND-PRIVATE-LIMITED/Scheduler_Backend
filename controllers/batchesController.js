@@ -427,7 +427,7 @@ const transformStudentData = (student) => {
 const getBatchStudents = async (req, res) => {
   const { id } = req.params; // batch_id
   try {
-    // 1. Fetch the bridge links first to get all student IDs in this batch
+    // 1. Get the list of all Student UUIDs linked to this batch
     const { data: links, error: linkError } = await supabase
       .from('batch_students')
       .select('student_id')
@@ -438,58 +438,55 @@ const getBatchStudents = async (req, res) => {
 
     const studentIds = links.map(l => l.student_id);
 
-    // 2. Fetch detailed student data from the financial summary view
-    // This view gives us 'courses_str' and 'student_id' directly.
-    const { data: viewData, error: viewError } = await supabase
-      .from('v_admission_financial_summary')
-      .select(`
-        student_id,
-        admission_number,
-        student_name,
-        student_phone_number,
-        courses_str,
-        certificate_name,
-        batch_preference,
-        balance_due,
-        next_task_due_date,
-        joined
-      `)
-      .in('student_id', studentIds);
+    // 2. Fetch data from BOTH sources in parallel
+    const [viewRes, studentsRes, countsRes] = await Promise.all([
+      // Data for Admitted Students
+      supabase.from('v_admission_financial_summary').select('*').in('student_id', studentIds),
+      // Data for ALL students (Master Table) - fallback for those not in view
+      supabase.from('students').select('*').in('id', studentIds),
+      // Batch counts for planning
+      supabase.from('batch_students').select('student_id').in('student_id', studentIds)
+    ]);
 
-    if (viewError) throw viewError;
+    if (viewRes.error) throw viewRes.error;
+    if (studentsRes.error) throw studentsRes.error;
+    if (countsRes.error) throw countsRes.error;
 
-    // 3. Fetch current batch counts for these students to help with planning
-    const { data: countData, error: countError } = await supabase
-      .from('batch_students')
-      .select('student_id')
-      .in('student_id', studentIds);
-
-    if (countError) throw countError;
-
-    // Helper to count occurrences of student_id in batch_students
-    const batchCounts = countData.reduce((acc, curr) => {
+    // 3. Create a map of batch counts
+    const batchCounts = countsRes.data.reduce((acc, curr) => {
       acc[curr.student_id] = (acc[curr.student_id] || 0) + 1;
       return acc;
     }, {});
 
-    // 4. Merge and Process
-    const processedStudents = viewData.map(student => {
-      // Logic for remarks/status often depends on balance_due
-      const isPaid = parseFloat(student.balance_due || 0) <= 0;
+    // 4. Create a map of Admission View data for quick lookup
+    const admissionMap = new Map(viewRes.data.map(item => [item.student_id, item]));
+
+    // 5. Merge logic: Use View data if exists, otherwise fallback to Master Student data
+    const processedStudents = studentsRes.data.map(s => {
+      const adm = admissionMap.get(s.id);
       
+      // If student is in the view, they are "Admitted"
+      // If not, they are "Pre-Admission"
+      const isAdmitted = !!adm;
+      const balance = adm ? parseFloat(adm.balance_due || 0) : 0;
+
       return {
-        id: student.student_id,
-        name: student.student_name,
-        admission_number: student.admission_number,
-        phone_number: student.student_phone_number,
-        // ✅ Courses aggregated from admission_courses
-        enrolled_courses: student.courses_str || student.certificate_name || "N/A",
-        // ✅ Count of batches from our calculation above
-        active_batches_count: batchCounts[student.student_id] || 0,
-        // Use the view's data for the remark status logic
-        remarks: isPaid ? "FULL PAID" : `Due: ${student.balance_due}`,
-        is_defaulter: false, // You can join students table here if needed for this flag
-        next_follow_up: student.next_task_due_date
+        id: s.id,
+        name: s.name,
+        admission_number: s.admission_number || "PENDING",
+        phone_number: s.phone_number || "N/A",
+        // ✅ Course Logic: View String > Batch Preference > Default
+        enrolled_courses: adm?.courses_str || adm?.certificate_name || s.remarks || "No Course Linked",
+        active_batches_count: batchCounts[s.id] || 1,
+        // ✅ Remark Logic: 
+        // If admitted: Show Paid/Due. 
+        // If not: Show student master remarks.
+        remarks: isAdmitted 
+          ? (balance <= 0 ? "FULL PAID" : `Due: ${balance}`) 
+          : (s.remarks || "Admission Pending"),
+        is_defaulter: s.is_defaulter || false,
+        next_follow_up: adm?.next_task_due_date || null,
+        status_label: isAdmitted ? "Admitted" : "Trial/Pending"
       };
     });
 
@@ -499,6 +496,7 @@ const getBatchStudents = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
+
 
 const getActiveStudentsCount = async (req, res) => {
   const isSuperAdmin = req.isSuperAdmin;
