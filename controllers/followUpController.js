@@ -1,40 +1,41 @@
-// server/controllers/followUpController.js
 const supabase = require('../db');
 const { format } = require('date-fns');
 
 /**
  * @description Get the task list for the main follow-up dashboard.
- * [UPDATED] Replaced 'pushpam' check with 'isSuperAdmin' for global branch access.
+ * Includes both "Joined" and "Pending/Trial" students with active tasks or installments.
  */
 exports.getFollowUpTasks = async (req, res) => {
   const { dateFilter, searchTerm, batchName, assignedTo, dueAmountMin, startDate, endDate } = req.query;
   const locationId = req.locationId;
-  const isSuperAdmin = req.isSuperAdmin; // ✅ From updated auth middleware
+  const isSuperAdmin = req.isSuperAdmin; 
 
   try {
     const today = format(new Date(), 'yyyy-MM-dd');
 
     const buildBaseFilters = (q) => {
-      // ✅ ROLE-BASED SECURITY: Bypass location filter if user is super_admin
+      // 1. Branch Security: SuperAdmins see everything, others see only their location
       if (!isSuperAdmin) {
         if (!locationId) throw new Error('LOCATION_REQUIRED');
         q = q.eq('location_id', locationId);
       }
       
-      // Strictly only show students who are still joined (exclude dropouts)
-      q = q.eq('joined', true);
+      // 2. Task-First Logic: Only show records where money is still owed
       q = q.gt('total_due_amount', 0);
       
+      // 3. Optional Search/Filters
       if (searchTerm) {
         q = q.or(`student_name.ilike.%${searchTerm}%,student_phone.ilike.%${searchTerm}%,admission_number.ilike.%${searchTerm}%`);
       }
       if (batchName) q = q.eq('batch_name', batchName);
       if (assignedTo) q = q.eq('assigned_to', assignedTo);
       if (dueAmountMin) q = q.gte('total_due_amount', dueAmountMin);
+      
       return q;
     };
 
-    // 1-3. Fetch Counts
+    // --- Part 1: Fetch Counts for Tab Badges ---
+    // Note: next_task_due_date in the view handles the Installment vs Follow-up priority.
     const [todayRes, overdueRes, upcomingRes] = await Promise.all([
       buildBaseFilters(supabase.from('v_follow_up_task_list').select('*', { count: 'exact', head: true }))
         .eq('next_task_due_date', today)
@@ -45,10 +46,11 @@ exports.getFollowUpTasks = async (req, res) => {
         .gt('next_task_due_date', today)
     ]);
 
-    // 4. Fetch actual list
+    // --- Part 2: Fetch Actual Data List ---
     let dataQuery = supabase.from('v_follow_up_task_list').select('*');
     dataQuery = buildBaseFilters(dataQuery);
 
+    // Apply Tab-specific date logic
     if (dateFilter === 'today') {
       dataQuery = dataQuery.eq('next_task_due_date', today)
                            .or(`last_log_created_at.is.null,last_log_created_at.lt.${today}`);
@@ -58,6 +60,7 @@ exports.getFollowUpTasks = async (req, res) => {
       dataQuery = dataQuery.gt('next_task_due_date', today);
     }
 
+    // Apply custom date range if selected (Advanced Filters)
     if (startDate) dataQuery = dataQuery.gte('next_task_due_date', startDate);
     if (endDate) dataQuery = dataQuery.lte('next_task_due_date', endDate);
 
@@ -74,57 +77,47 @@ exports.getFollowUpTasks = async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Error fetching tasks:', error);
+    console.error('Follow-up Fetch Error:', error);
     if (error.message === 'LOCATION_REQUIRED') {
-      return res.status(403).json({ error: 'Unauthorized: No branch assigned.' });
+      return res.status(403).json({ error: 'Unauthorized: No branch context provided.' });
     }
-    res.status(500).json({ error: 'An unexpected error occurred.' });
+    res.status(500).json({ error: 'Server error fetching follow-up tasks.' });
   }
 };
 
 /**
- * @description Create a follow-up log.
- * [UPDATED] Replaced 'pushpam' check with 'isSuperAdmin' gate.
+ * @description Create a manual follow-up log.
  */
 exports.createFollowUpLog = async (req, res) => {
   const { admission_id, notes, next_follow_up_date, type, lead_type } = req.body;
   const user_id = req.user?.id;
   const locationId = req.locationId;
-  const isSuperAdmin = req.isSuperAdmin; // ✅ From updated auth middleware
+  const isSuperAdmin = req.isSuperAdmin;
 
   if (!admission_id || !user_id) {
-    return res.status(400).json({ error: 'admission_id and user_id are required.' });
+    return res.status(400).json({ error: 'Missing admission_id or user_id.' });
   }
 
   try {
-    // 1. Fetch the admission AND the linked student's location
+    // 1. Resolve student location for security check
     const { data: admission, error: fetchErr } = await supabase
       .from('admissions')
-      .select(`
-        location_id,
-        students (location_id)
-      `)
+      .select(`location_id, students (location_id)`)
       .eq('id', admission_id)
       .maybeSingle();
 
     if (fetchErr) throw fetchErr;
-    if (!admission) {
-      return res.status(404).json({ error: `Admission record [${admission_id}] not found.` });
-    }
+    if (!admission) return res.status(404).json({ error: "Admission not found." });
 
-    // 2. Resolve the actual location
-    const studentLocation = admission.location_id || (admission.students && admission.students.location_id);
-
-    // 3. ✅ SECURITY GATE: Same branch check, bypassed for super_admin
+    const studentLocation = admission.location_id || admission.students?.location_id;
     const isSameBranch = studentLocation && locationId && (Number(studentLocation) === Number(locationId));
 
+    // 2. Security Gate
     if (!isSuperAdmin && !isSameBranch) {
-      return res.status(403).json({ 
-        error: `Access Denied. Branch mismatch (Student Branch: ${studentLocation || 'Unknown'}, Your Branch: ${locationId})` 
-      });
+      return res.status(403).json({ error: "Branch access restricted." });
     }
 
-    // 4. Insert Follow-up
+    // 3. Log the follow-up
     const { data: followUp, error: insertError } = await supabase
       .from('follow_ups')
       .insert({
@@ -141,29 +134,23 @@ exports.createFollowUpLog = async (req, res) => {
 
     if (insertError) throw insertError;
 
-    // 5. Return with staff name
     const { data: userData } = await supabase.from('users').select('username').eq('id', user_id).single();
 
     res.status(201).json({ 
-      message: "Follow-up log saved.", 
+      message: "Follow-up saved successfully.", 
       data: { ...followUp, staff_name: userData?.username || 'System' } 
     });
   } catch (error) {
-    console.error('Error creating follow-up log:', error);
-    res.status(500).json({ error: error.message || 'Internal server error.' });
+    console.error('Error creating log:', error);
+    res.status(500).json({ error: 'Failed to save follow-up log.' });
   }
 };
 
 /**
- * @description Fetch history for a specific admission.
+ * @description Get history for an admission.
  */
 exports.getFollowUpHistoryForAdmission = async (req, res) => {
   const { admissionId } = req.params;
-
-  if (!admissionId) {
-    return res.status(400).json({ error: 'Admission ID is required.' });
-  }
-
   try {
     const { data: logs, error: logsError } = await supabase
       .from('follow_up_details') 
@@ -177,14 +164,8 @@ exports.getFollowUpHistoryForAdmission = async (req, res) => {
     let staffMap = {};
 
     if (staffIds.length > 0) {
-      const { data: staffData } = await supabase
-        .from('users')
-        .select('id, username')
-        .in('id', staffIds);
-
-      staffData?.forEach(user => {
-        staffMap[user.id] = user.username;
-      });
+      const { data: staffData } = await supabase.from('users').select('id, username').in('id', staffIds);
+      staffData?.forEach(user => { staffMap[user.id] = user.username; });
     }
 
     const formattedHistory = (logs || []).map(log => ({
@@ -194,7 +175,6 @@ exports.getFollowUpHistoryForAdmission = async (req, res) => {
 
     res.status(200).json(formattedHistory);
   } catch (error) {
-    console.error('Error fetching history:', error);
-    res.status(500).json({ error: 'An unexpected error occurred.' });
+    res.status(500).json({ error: 'Failed to fetch history.' });
   }
 };
