@@ -3,7 +3,7 @@ const { format } = require('date-fns');
 
 /**
  * @description Get the task list for the main follow-up dashboard.
- * Includes both "Joined" and "Pending/Trial" students with active tasks or installments.
+ * UPDATED: Strictly excludes students formally marked as dropouts using the boolean flag.
  */
 exports.getFollowUpTasks = async (req, res) => {
   const { dateFilter, searchTerm, batchName, assignedTo, dueAmountMin, startDate, endDate } = req.query;
@@ -22,8 +22,12 @@ exports.getFollowUpTasks = async (req, res) => {
       
       // 2. Task-First Logic: Only show records where money is still owed
       q = q.gt('total_due_amount', 0);
+
+      // ✅ 3. DROPOUT FILTER: Strictly exclude dropouts from collection lists
+      // This uses the is_dropout column we added to the v_follow_up_task_list view
+      q = q.eq('is_dropout', false);
       
-      // 3. Optional Search/Filters
+      // 4. Optional Search/Filters
       if (searchTerm) {
         q = q.or(`student_name.ilike.%${searchTerm}%,student_phone.ilike.%${searchTerm}%,admission_number.ilike.%${searchTerm}%`);
       }
@@ -35,7 +39,6 @@ exports.getFollowUpTasks = async (req, res) => {
     };
 
     // --- Part 1: Fetch Counts for Tab Badges ---
-    // Note: next_task_due_date in the view handles the Installment vs Follow-up priority.
     const [todayRes, overdueRes, upcomingRes] = await Promise.all([
       buildBaseFilters(supabase.from('v_follow_up_task_list').select('*', { count: 'exact', head: true }))
         .eq('next_task_due_date', today)
@@ -81,7 +84,7 @@ exports.getFollowUpTasks = async (req, res) => {
     if (error.message === 'LOCATION_REQUIRED') {
       return res.status(403).json({ error: 'Unauthorized: No branch context provided.' });
     }
-    res.status(500).json({ error: 'Server error fetching follow-up tasks.' });
+    res.status(500).json({ error: 'An unexpected error occurred.' });
   }
 };
 
@@ -109,10 +112,10 @@ exports.createFollowUpLog = async (req, res) => {
     if (fetchErr) throw fetchErr;
     if (!admission) return res.status(404).json({ error: "Admission not found." });
 
-    const studentLocation = admission.location_id || admission.students?.location_id;
+    const studentLocation = admission.location_id || (admission.students && admission.students.location_id);
     const isSameBranch = studentLocation && locationId && (Number(studentLocation) === Number(locationId));
 
-    // 2. Security Gate
+    // 2. Security Gate: Super admin bypass
     if (!isSuperAdmin && !isSameBranch) {
       return res.status(403).json({ error: "Branch access restricted." });
     }
@@ -175,6 +178,7 @@ exports.getFollowUpHistoryForAdmission = async (req, res) => {
 
     res.status(200).json(formattedHistory);
   } catch (error) {
+    console.error('Error fetching history:', error);
     res.status(500).json({ error: 'Failed to fetch history.' });
   }
 };

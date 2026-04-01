@@ -257,44 +257,53 @@ exports.updateAdmission = async (req, res) => {
 
 /**
  * @description
- * Mark a student as a Dropout.
- * STRICT SECURITY: Only roles with 'super_admin' can proceed.
+ * Formally marks a student as a Dropout using boolean flags.
+ * This is now the "Source of Truth" for your collection dashboards.
  */
 exports.markStudentDropout = async (req, res) => {
-  const { id } = req.params;
+  const { id } = req.params; // admission_id
   const { dropout_reason } = req.body;
   const userId = req.user?.id;
 
-  if (!id || id === 'undefined' || id.length < 30) {
+  // Basic validation
+  if (!id || id.length < 30) {
     return res.status(400).json({ error: "Invalid Admission ID." });
   }
 
-  // ✅ ROLE-BASED SECURITY GATE
+  // ✅ SUPER ADMIN SECURITY GATE
   if (!req.isSuperAdmin) {
-    return res.status(403).json({ error: "Access denied. Super Admin privileges required to process dropouts." });
+    return res.status(403).json({ error: "Unauthorized. Super Admin access required." });
   }
 
   try {
+    // 1. Update the record using the new columns we just added
     const { error: updateError } = await supabase
       .from('admissions')
       .update({ 
-        joined: false, 
-        remarks: `DROPOUT: ${dropout_reason}` 
+        joined: false,          // Remove from active batch rosters
+        is_dropout: true,       // Formal boolean flag
+        dropout_reason: dropout_reason || "No specific reason provided",
+        dropout_at: new Date().toISOString(),
+        updated_at: new Date().toISOString() // Keeps sync with triggers
       })
       .eq('id', id);
 
     if (updateError) throw updateError;
 
+    // 2. Add an audit log entry in your remarks table
     await supabase.from('admission_remarks').insert([{
       admission_id: id,
-      remark_text: `MARKED AS DROPOUT. Reason: ${dropout_reason}`,
+      remark_text: `CRITICAL STATUS CHANGE: STUDENT DROPPED OUT. Reason: ${dropout_reason || 'N/A'}`,
       created_by: userId
     }]);
 
-    res.status(200).json({ message: 'Dropout processed.' });
+    res.status(200).json({ 
+      message: 'Dropout processed successfully. Student is now excluded from active collection lists.',
+      id 
+    });
   } catch (error) {
-    console.error('Dropout Error:', error);
-    res.status(500).json({ error: error.message });
+    console.error('Dropout Logic Error:', error);
+    res.status(500).json({ error: "Failed to process dropout status." });
   }
 };
 

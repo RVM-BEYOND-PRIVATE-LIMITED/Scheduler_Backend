@@ -1,9 +1,14 @@
 const supabase = require('../db');
 
+/**
+ * @description
+ * Fetches data for the main dashboard.
+ * UPDATED: Strictly excludes dropouts and fixed search logic for student fields.
+ */
 exports.getDashboardData = async (req, res) => {
   // 1. Capture authorization context
   const userLocationId = req.locationId || req.user?.location_id; 
-  const isSuperAdmin = req.isSuperAdmin; // ✅ From auth middleware
+  const isSuperAdmin = req.isSuperAdmin; 
 
   const { 
     search = '', 
@@ -12,7 +17,7 @@ exports.getDashboardData = async (req, res) => {
     undertaking, 
     startDate, 
     endDate,
-    location_id // ✅ Added for Super Admin city filtering
+    location_id 
   } = req.query;
 
   // Standard Admins must have a location assigned
@@ -23,7 +28,7 @@ exports.getDashboardData = async (req, res) => {
   try {
     /**
      * ✅ EXTENSIVE DATA FETCHING 
-     * We query 'admissions' as base to get 'staff' details.
+     * Using !inner join with financial summary view.
      */
     let query = supabase
       .from('admissions')
@@ -40,14 +45,16 @@ exports.getDashboardData = async (req, res) => {
 
     // ✅ 🛡️ ROLE-BASED LOCATION FILTERING
     if (isSuperAdmin) {
-      // Super Admin: Use specific location_id if provided, else show ALL locations
       if (location_id && location_id !== 'all' && location_id !== 'All') {
         query = query.eq('location_id', Number(location_id));
       }
     } else {
-      // Standard Admin: Strictly restricted to their own branch
       query = query.eq('location_id', userLocationId);
     }
+
+    // ✅ 🚫 DROPOUT FILTERING
+    // Strictly exclude students marked as dropouts from dashboard metrics and lists
+    query = query.eq('is_dropout', false);
 
     // ✅ DATE FILTERING
     if (startDate) query = query.gte('date_of_admission', startDate);
@@ -68,7 +75,9 @@ exports.getDashboardData = async (req, res) => {
       query = query.eq('v_admission_financial_summary.undertaking_status', undertaking);
     }
 
-    // ✅ SEARCH LOGIC
+    // ✅ SEARCH LOGIC (FIXED)
+    // We search via the foreignTable 'v_admission_financial_summary' 
+    // because that's where student_name and admission_number exist.
     if (search) {
       const s = `%${search}%`;
       query = query.or(
@@ -95,7 +104,7 @@ exports.getDashboardData = async (req, res) => {
       };
     });
 
-    // ✅ 3. METRICS CALCULATION
+    // ✅ 3. METRICS CALCULATION (Filtered Context)
     const now = new Date();
     const currentMonth = now.getMonth();
     const currentYear = now.getFullYear();

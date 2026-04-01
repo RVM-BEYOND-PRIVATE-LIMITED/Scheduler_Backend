@@ -374,11 +374,12 @@ exports.getAccountDetails = async (req, res) => {
 
 /**
  * @description Get comprehensive data for receipt generation.
+ * UPDATED: Includes full installment schedule for the student.
  */
 exports.getReceiptData = async (req, res) => {
   const { paymentId } = req.params;
   const locationId = req.locationId; 
-  const isSuperAdmin = req.isSuperAdmin; // ✅ Updated logic
+  const isSuperAdmin = req.isSuperAdmin; 
 
   if (!paymentId) return res.status(400).json({ error: 'Payment ID is required.' });
 
@@ -410,12 +411,23 @@ exports.getReceiptData = async (req, res) => {
       return res.status(403).json({ error: 'Access denied: Branch mismatch.' });
     }
 
+    // --- Next Due Prediction Logic ---
     const nextInst = (admissionData.installments || [])
       .filter(i => i.status !== 'Paid')
       .sort((a, b) => new Date(a.due_date).getTime() - new Date(b.due_date).getTime())[0];
 
+    // --- Installment Schedule for Receipt Table ---
+    const installmentSchedule = (admissionData.installments || [])
+      .map(inst => ({
+        due_date: inst.due_date,
+        amount: inst.amount,
+        status: inst.status
+      }))
+      .sort((a, b) => new Date(a.due_date).getTime() - new Date(b.due_date).getTime());
+
     const batchString = studentData?.batch_students?.map(bs => bs.batches?.name).filter(Boolean).join(', ') || 'Not Allotted';
 
+    // --- GST Calculation Logic ---
     let gstBreakdown = { cgst: 0, sgst: 0, totalGst: 0, rate: admissionData.gst_rate || 0 };
     let taxableAmount = Number(payment.amount_paid);
     
@@ -445,6 +457,10 @@ exports.getReceiptData = async (req, res) => {
       taxable_amount: taxableAmount.toFixed(2),
       gst_summary: gstBreakdown,
       total_payable_admission: admissionData.total_payable_amount,
+      
+      // ✅ NEW: Added the full installment plan
+      installment_schedule: installmentSchedule,
+      
       prediction: {
         next_due_date: nextInst ? nextInst.due_date : null,
         next_due_amount: nextInst ? nextInst.amount : 0,

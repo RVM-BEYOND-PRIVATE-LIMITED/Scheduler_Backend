@@ -3,13 +3,13 @@ const supabase = require('../db');
 
 /* ===========================================================
    GET BATCH ALLOTMENT LIST (LOCATION & ROLE AWARE)
+   UPDATED: Strictly excludes students marked as is_dropout
    =========================================================== */
 exports.getBatchAllotmentList = async (req, res) => {
   const userLocationId = req.locationId ? Number(req.locationId) : null;
   const isSuperAdmin = req.isSuperAdmin;
 
   try {
-    // ✅ Extracting parameters; startDate/endDate now used for Joining Range
     const { 
       search = '', 
       location_id, 
@@ -31,7 +31,8 @@ exports.getBatchAllotmentList = async (req, res) => {
         batch_names,
         remarks,
         course_start_date,
-        joined
+        joined,
+        is_dropout
       `);
 
     /* --- 🛡️ LOCATION FILTERING --- */
@@ -44,8 +45,11 @@ exports.getBatchAllotmentList = async (req, res) => {
       query = query.eq('location_id', userLocationId);
     }
 
-    /* --- 📅 UPDATED: JOINING DATE RANGE FILTERING --- */
-    // Logic switched from date_of_admission to course_start_date
+    /* --- 🚫 DROPOUT FILTERING --- */
+    // ✅ RIGID FIX: Only show active students who are NOT marked as dropouts
+    query = query.eq('is_dropout', false);
+
+    /* --- 📅 JOINING DATE RANGE FILTERING --- */
     if (startDate) {
       query = query.gte('course_start_date', startDate);
     }
@@ -53,7 +57,7 @@ exports.getBatchAllotmentList = async (req, res) => {
       query = query.lte('course_start_date', endDate);
     }
 
-    /* --- 🔍 IMPROVED FILTER LOGIC --- */
+    /* --- 🔍 FILTER LOGIC --- */
     if (filter === 'allotted_not_joined') {
       query = query
         .not('batch_names', 'is', null)
@@ -101,6 +105,7 @@ exports.getBatchAllotmentList = async (req, res) => {
     res.status(500).json({ error: 'Failed to load batch allotment list' });
   }
 };
+
 
 /* ===========================================================
    UPDATE BATCH ALLOTMENT (CONTROLLER FIX)

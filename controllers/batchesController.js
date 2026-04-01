@@ -18,7 +18,9 @@ const getAllBatches = async (req, res) => {
   try {
     const isSuperAdmin = req.isSuperAdmin;
     const userLocationId = req.locationId;
-    const { facultyId, location_id } = req.query; // ✅ location_id added for Super Admin filtering
+    
+    // ✅ Added startDate and endDate to the destructuring
+    const { facultyId, location_id, startDate, endDate } = req.query; 
 
     if (!userLocationId && !isSuperAdmin) {
       return res.status(401).json({ error: 'Authentication required with location.' });
@@ -29,12 +31,10 @@ const getAllBatches = async (req, res) => {
     /* -------------------- 🛡️ ROLE-BASED LOCATION LOGIC -------------------- */
     let targetLocationId = null;
     if (isSuperAdmin) {
-      // Super Admin: Can focus on one branch or see all if 'all'/undefined
       if (location_id && location_id !== 'all' && location_id !== 'All') {
         targetLocationId = Number(location_id);
       }
     } else {
-      // Admin/Faculty: Strictly restricted to their own branch
       targetLocationId = Number(userLocationId);
     }
 
@@ -47,7 +47,6 @@ const getAllBatches = async (req, res) => {
           students:batch_students(count)
         `);
         
-        // Apply location filter if we are NOT in global Super Admin mode
         if (targetLocationId) {
           query = query.eq('location_id', targetLocationId);
         }
@@ -55,9 +54,22 @@ const getAllBatches = async (req, res) => {
         if (facultyId) {
           query = query.eq('faculty_id', facultyId);
         }
+
+        // ✅ NEW: DATE FILTERS
+        // To see batches starting "today" or a specific date
+        if (startDate) {
+          query = query.eq('start_date', startDate);
+        }
+
+        // To see batches that ended "yesterday" or any specific date
+        if (endDate) {
+          query = query.eq('end_date', endDate);
+        }
+
         return query;
       })(),
 
+      // ... (rest of your sub-queries remain the same)
       (() => {
         let subQuery = supabase.from('faculty_substitutions')
           .select(`*, substitute:substitute_faculty_id(*), batches!inner(location_id)`)
@@ -103,7 +115,6 @@ const getAllBatches = async (req, res) => {
       return finalBatch;
     });
     
-    // Logic for Faculty Users: Filter the scoped results to only show their own batches
     if (req.user && req.user.role === 'faculty') {
         const targetFacultyId = req.user.faculty_id;
         return res.json(formattedData.filter(batch => batch.faculty_id === targetFacultyId));
