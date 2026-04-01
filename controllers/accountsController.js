@@ -195,18 +195,19 @@ const numToWords = (n) => {
  * @description Record payment and sync across payments and receipts tables.
  * [UPDATED] Robust branch validation and automated installment balancing.
  */
+// Inside controllers/accountsController.js
+
 exports.recordPayment = async (req, res) => {
   const { admission_id, amount_paid, payment_date, method, notes } = req.body;
   const user_id = req.user?.id;
   const locationId = req.locationId; 
-  const isSuperAdmin = req.isSuperAdmin; // ✅ Updated logic
+  const isSuperAdmin = req.isSuperAdmin;
 
   if (!admission_id || !amount_paid || !payment_date || !method || !user_id) {
     return res.status(400).json({ error: 'Missing required fields.' });
   }
 
   try {
-    // 1. Verify branch before recording payment
     const { data: adm, error: admError } = await supabase
       .from('admissions')
       .select('location_id')
@@ -215,16 +216,19 @@ exports.recordPayment = async (req, res) => {
 
     if (admError || !adm) return res.status(404).json({ error: 'Admission not found.' });
 
-    // ✅ Security: Super Admin override for global branch access
     if (!isSuperAdmin && Number(adm.location_id) !== Number(locationId)) {
-      return res.status(403).json({ error: 'Unauthorized: Cannot record payment for another branch.' });
+      return res.status(403).json({ error: 'Unauthorized: Branch mismatch.' });
     }
 
-    // 2. Generate unique receipt number via database sequence
-    const { data: receiptNumber, error: receiptError } = await supabase.rpc('generate_receipt_number');
-    if (receiptError || !receiptNumber) throw new Error('Failed to generate receipt number');
+    // 🔥 UPDATED: Call the new financial year receipt generator
+    const { data: receiptNumber, error: receiptError } = await supabase.rpc('generate_rvm_receipt_number');
+    
+    if (receiptError) {
+        console.error("Receipt Generation Error:", receiptError);
+        throw new Error('Failed to generate receipt number');
+    }
 
-    // 3. Insert primary payment record
+    // 3. Insert payment record
     const { data: paymentData, error: paymentError } = await supabase
       .from('payments')
       .insert({
@@ -232,7 +236,7 @@ exports.recordPayment = async (req, res) => {
         amount_paid: parseFloat(amount_paid),
         payment_date,
         method,
-        receipt_number: receiptNumber,
+        receipt_number: receiptNumber, // New format: RVMBEYOND/2627/00001
         notes,
         created_by: user_id,
       })
@@ -240,14 +244,10 @@ exports.recordPayment = async (req, res) => {
 
     if (paymentError) throw paymentError;
 
-    // 4. Trigger FIFO Installment Balancing
-    const { error: rpcError } = await supabase.rpc('apply_payment_to_installments', { 
-      p_payment_id: paymentData.id 
-    });
-    
-    if (rpcError) console.warn("Installment balancing warning:", rpcError.message);
+    // 4. Installment Balancing
+    await supabase.rpc('apply_payment_to_installments', { p_payment_id: paymentData.id });
 
-    // 5. Sync with Receipts table for historical auditing
+    // 5. Sync with Receipts table
     await supabase.from('receipts').insert({
         admission_id,
         receipt_number: receiptNumber,
@@ -264,8 +264,8 @@ exports.recordPayment = async (req, res) => {
       receipt_number: receiptNumber 
     });
   } catch (error) {
-    console.error('Critical Payment Error:', error);
-    res.status(500).json({ error: 'An error occurred while recording the payment.' });
+    console.error('Payment Error:', error);
+    res.status(500).json({ error: 'Failed to record payment.' });
   }
 };
 
