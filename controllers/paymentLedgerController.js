@@ -4,12 +4,13 @@ const supabase = require('../db.js');
  * @description 
  * Fetches all payment records with a total collection sum for auditing.
  * Super Admins see all branches; standard Admins are restricted by location.
+ * [UPDATED] Added student_phone_number to search logic.
  */
 exports.getPaymentLedger = async (req, res) => {
   // Increased default limit to 1000 to handle higher volume audit periods
-  const { from, to, location, method, searchTerm, page = 1, limit = 1000 } = req.query;
+  const { from, to, location, method, searchTerm, page = 1, limit = 10000 } = req.query;
   const locationId = req.locationId;
-  const isSuperAdmin = req.isSuperAdmin; // ✅ Replaced hardcoded 'pushpam' check
+  const isSuperAdmin = req.isSuperAdmin; 
 
   try {
     // 1. Base Query Setup - Selecting from the location-aware view
@@ -32,7 +33,8 @@ exports.getPaymentLedger = async (req, res) => {
     if (method && method !== 'all') query = query.eq("method", method);
 
     if (searchTerm) {
-      query = query.or(`student_name.ilike.%${searchTerm}%,receipt_number.ilike.%${searchTerm}%,admission_number.ilike.%${searchTerm}%`);
+      // ✅ UPDATED: Added student_phone_number to the search parameters
+      query = query.or(`student_name.ilike.%${searchTerm}%,receipt_number.ilike.%${searchTerm}%,admission_number.ilike.%${searchTerm}%,student_phone_number.ilike.%${searchTerm}%`);
     }
 
     // 3. FETCH DATA (Paginated)
