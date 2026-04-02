@@ -284,11 +284,96 @@ const setDefaulterStatus = async (req, res) => {
   }
 };
 
+
+/**
+ * @description
+ * Transfers a student to a different branch/location.
+ * Because of the database triggers we installed, this will automatically
+ * update the location_id in the Admissions table as well.
+ */
+const transferStudentLocation = async (req, res) => {
+  const { id } = req.params; // Student UUID
+  const { new_location_id } = req.body;
+  const isSuperAdmin = req.isSuperAdmin;
+  const staffName = req.user?.username || 'Admin';
+
+  if (!new_location_id) {
+    return res.status(400).json({ error: 'Target location ID is required.' });
+  }
+
+  try {
+    // 1. Security Gate: Only Super Admins should ideally move students between branches
+    if (!isSuperAdmin) {
+      return res.status(403).json({ 
+        error: "Access denied. Only Super Admins can perform inter-branch transfers." 
+      });
+    }
+
+    // 2. Fetch current student data to check admission number
+    const { data: student, error: fetchError } = await supabase
+      .from('students')
+      .select('name, admission_number, location_id')
+      .eq('id', id)
+      .single();
+
+    if (fetchError || !student) {
+      return res.status(404).json({ error: 'Student record not found.' });
+    }
+
+    // 3. Prevent redundant updates
+    if (Number(student.location_id) === Number(new_location_id)) {
+      return res.status(400).json({ error: 'Student is already assigned to this location.' });
+    }
+
+    // 4. Perform the Update
+    // NOTE: The trigger 'tr_sync_location_only' will automatically update 
+    // the admissions table immediately after this succeeds.
+    const { data: updatedStudent, error: updateError } = await supabase
+      .from('students')
+      .update({ 
+        location_id: new_location_id,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (updateError) {
+      // Handle the Unique Constraint error (Admission Number + Location)
+      if (updateError.code === '23505') {
+        return res.status(409).json({ 
+          error: `Transfer Failed: Admission number '${student.admission_number}' is already in use at the target location.` 
+        });
+      }
+      throw updateError;
+    }
+
+    // 5. Log the Activity
+    await logActivity(
+      'transferred', 
+      `student ${student.name} from branch ${student.location_id} to ${new_location_id}`, 
+      staffName
+    );
+
+    res.status(200).json({
+      success: true,
+      message: `Student successfully transferred to Branch #${new_location_id}`,
+      student: updatedStudent
+    });
+
+  } catch (error) {
+    console.error('Transfer Error:', error);
+    res.status(500).json({ error: 'Internal server error during branch transfer.' });
+  }
+};
+
+
 module.exports = {
   getAllStudents,
   createStudent,
   updateStudent,
   deleteStudent,
   getStudentBatches,
-  setDefaulterStatus
+  setDefaulterStatus,
+  transferStudentLocation
 };

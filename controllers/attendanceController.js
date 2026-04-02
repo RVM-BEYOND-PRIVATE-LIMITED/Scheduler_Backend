@@ -190,9 +190,7 @@ const getBatchAttendanceReport = async (req, res) => {
           students:student_id (
             *,
             follow_up:v_follow_up_task_list (
-              next_task_due_date,
-              total_due,
-              task_count
+              total_due
             )
           )
         `)
@@ -205,66 +203,99 @@ const getBatchAttendanceReport = async (req, res) => {
     ]);
 
     if (batchError || studentError || attendanceError) throw (batchError || studentError || attendanceError);
-    if (!studentLinks || studentLinks.length === 0) return res.status(404).json({ error: 'No students found for this batch.' });
 
-    // 1. Generate strictly valid schedule dates
+    // --- AUTOMATIC SYNC LOGIC (RVM ONLY) ---
+    const updatePromises = [];
+
+    const processedStudents = studentLinks.map(link => {
+      const student = link.students;
+      if (!student) return null;
+
+      const totalDue = Number(student.follow_up?.[0]?.total_due || 0);
+      let currentRemarks = student.remarks || '';
+      const admissionNo = (student.admission_number || "").trim();
+
+      /**
+       * ✅ CONDITIONAL SYNC GUARD
+       * We ONLY auto-update to "FULL PAID" if:
+       * 1. The ID starts with RVM- (Modern System)
+       * 2. The Total Due is 0 or less
+       * 3. The current remark isn't already 'FULL PAID'
+       */
+      if (admissionNo.startsWith('RVM-') && totalDue <= 0 && !/full\s*paid/i.test(currentRemarks)) {
+        currentRemarks = "FULL PAID";
+        
+        updatePromises.push(
+          supabase
+            .from('students')
+            .update({ remarks: "FULL PAID", updated_at: new Date().toISOString() })
+            .eq('id', student.id)
+        );
+      }
+
+      return {
+        id: student.id,
+        name: student.name?.trim() || 'Unknown',
+        admission_number: admissionNo,
+        phone_number: (student.phone_number || '').trim(),
+        remarks: currentRemarks, // Will be "FULL PAID" for RVM students, or original date/remark for legacy
+        total_due_amount: totalDue,
+        is_defaulter: !!student.is_defaulter,
+        is_banned: !!student.is_banned,
+        is_suspended: !!student.is_suspended,
+        suspended_until: student.suspended_until
+      };
+    }).filter(Boolean);
+
+    // Execute RVM updates in background
+    if (updatePromises.length > 0) {
+      Promise.all(updatePromises).catch(err => console.error("RVM Auto-remark error:", err));
+    }
+
+    /* -------------------------------------------------------------------------- */
+    /* 1. Generate strictly valid schedule dates                                  */
+    /* -------------------------------------------------------------------------- */
     const expectedDates = getExpectedSessionDates(startDate, endDate, batchInfo.schedule);
 
-    // 2. Map existing attendance for quick lookup: { "2024-03-20": { "student_id": true } }
+    /* -------------------------------------------------------------------------- */
+    /* 2. Map existing attendance for quick lookup                                */
+    /* -------------------------------------------------------------------------- */
     const existingAttendanceMap = (attendanceRecords || []).reduce((acc, rec) => {
       if (!acc[rec.date]) acc[rec.date] = {};
       acc[rec.date][rec.student_id] = rec.is_present;
       return acc;
     }, {});
 
-    // 3. Process students (Logic for remarks remains same)
-    const processedStudents = studentLinks.map(link => {
-      const student = link.students;
-      if (!student) return null;
-      // ... [Keep your existing RVM / Legacy remark logic here] ...
-      return {
-        id: student.id,
-        name: student.name?.trim() || 'Unknown',
-        admission_number: student.admission_number || 'N/A',
-        phone_number: student.phone_number || '',
-        remarks: student.remarks || 'No Remark', // Simplified for brevity, use your full logic
-        is_defaulter: !!student.is_defaulter 
-      };
-    }).filter(Boolean);
-
-    // 4. 🔥 NEW RIGID LOGIC: Construct attendance_by_date including missing days
+    /* -------------------------------------------------------------------------- */
+    /* 3. Construct attendance_by_date including missing days                     */
+    /* -------------------------------------------------------------------------- */
     const attendance_by_date = {};
-
     expectedDates.forEach(date => {
       attendance_by_date[date] = processedStudents.map(student => {
         const wasMarked = existingAttendanceMap[date] && existingAttendanceMap[date][student.id] !== undefined;
         return {
           student_id: student.id,
-          // If marked in DB, use that value. If NOT marked, force 'false' (Absent).
           is_present: wasMarked ? existingAttendanceMap[date][student.id] : false,
-          is_auto_absent: !wasMarked // Useful flag for frontend to show a warning
+          is_auto_absent: !wasMarked 
         };
       });
     });
 
-    const markedDates = [...new Set(attendanceRecords.map(r => r.date))];
-    const missingDates = expectedDates.filter(d => !markedDates.includes(d));
-
     res.status(200).json({ 
       students: processedStudents, 
-      attendance_by_date, 
+      attendance_by_date,
       compliance: {
-        missing_attendance_dates: missingDates,
         expected_days_count: expectedDates.length,
-        marked_days_count: markedDates.length,
-        is_fully_marked: missingDates.length === 0
+        marked_days_count: Object.keys(existingAttendanceMap).length
       }
     });
+
   } catch (error) {
     console.error("Batch Report Error:", error);
     res.status(500).json({ error: error.message });
   }
 };
+
 const getFacultyAttendanceReport = async (req, res) => {
   const { facultyId } = req.params;
   const { startDate, endDate, location_id } = req.query; 

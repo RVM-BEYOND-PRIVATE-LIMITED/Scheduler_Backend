@@ -4,12 +4,13 @@ const supabase = require('../db');
 
 /**
  * @description
- * Get Admission Dashboard rows. 
+ * Get Admission Dashboard rows for ACTIVE students. 
  * Super Admins see all branches; standard Admins are filtered by locationId.
+ * Drops-outs are strictly excluded from this view.
  */
 exports.getAllAdmissions = async (req, res) => {
   const locationId = req.locationId;
-  const isSuperAdmin = req.isSuperAdmin; // From updated auth middleware
+  const isSuperAdmin = req.isSuperAdmin; 
 
   try {
     const searchTerm = req.query.search || '';
@@ -17,13 +18,18 @@ exports.getAllAdmissions = async (req, res) => {
     /* ----------------------- 1. FETCH ROW DATA ----------------------- */
     let query = supabase.from('v_admission_financial_summary').select('*');
 
-    // ✅ ROLE-BASED FILTER: Only apply location restriction if NOT super_admin
+    // ✅ SEGREGATION: Force only ACTIVE (non-dropout) students to show on dashboard
+    query = query.eq('is_dropout', false);
+
+    // ✅ ROLE-BASED FILTER
     if (!isSuperAdmin) {
       if (!locationId) return res.status(401).json({ error: 'Location context missing.' });
       query = query.eq('location_id', locationId);
     }
 
     if (searchTerm) {
+      // Note: When using .or() with existing .eq() filters, 
+      // Supabase wraps the .or in parentheses automatically: (is_dropout=false AND (name ILIKE ...))
       query = query.or(`student_name.ilike.%${searchTerm}%,student_phone_number.ilike.%${searchTerm}%,admission_number.ilike.%${searchTerm}%`);
     }
 
@@ -52,15 +58,17 @@ exports.getAllAdmissions = async (req, res) => {
 
       if (createdAt.getMonth() === currentMonth && createdAt.getFullYear() === currentYear) {
         admissionsThisMonth += 1;
+        // Only counting revenue from admissions created this month for this specific metric
         revenueCollectedThisMonth += Number(r.total_paid || 0);
       }
 
-      if (r.status === 'Pending' && new Date(r.next_task_due_date) < now) {
+      if (r.status === 'Pending' && r.next_task_due_date && new Date(r.next_task_due_date) < now) {
         overdueCount += 1;
       }
 
       return {
         ...r,
+        // Using approval_status as a proxy for the administrative process completion
         undertaking_status: r.approval_status === 'Approved' ? 'Completed' : 'Pending',
       };
     });
@@ -255,57 +263,60 @@ exports.updateAdmission = async (req, res) => {
   }
 };
 
-/**
- * @description
- * Formally marks a student as a Dropout using boolean flags.
- * This is now the "Source of Truth" for your collection dashboards.
- */
 exports.markStudentDropout = async (req, res) => {
-  const { id } = req.params; // admission_id
+  const { id } = req.params; 
   const { dropout_reason } = req.body;
   const userId = req.user?.id;
 
-  // Basic validation
-  if (!id || id.length < 30) {
+  if (!id || id === 'undefined') {
     return res.status(400).json({ error: "Invalid Admission ID." });
   }
 
-  // ✅ SUPER ADMIN SECURITY GATE
+  // ✅ ROLE-BASED SECURITY GATE
   if (!req.isSuperAdmin) {
-    return res.status(403).json({ error: "Unauthorized. Super Admin access required." });
+    return res.status(403).json({ 
+      error: "Access denied. Super Admin privileges required." 
+    });
   }
 
   try {
-    // 1. Update the record using the new columns we just added
-    const { error: updateError } = await supabase
+    // 1. Update the Admission record
+    const { data, error: updateError } = await supabase
       .from('admissions')
       .update({ 
-        joined: false,          // Remove from active batch rosters
-        is_dropout: true,       // Formal boolean flag
-        dropout_reason: dropout_reason || "No specific reason provided",
+        joined: false,          // This removes them from active dashboards
+        is_dropout: true,       // This moves them to the registry
+        dropout_reason: dropout_reason || "No reason provided",
         dropout_at: new Date().toISOString(),
-        updated_at: new Date().toISOString() // Keeps sync with triggers
+        updated_at: new Date().toISOString()
       })
-      .eq('id', id);
+      .eq('id', id)
+      .select();                // Returns updated row for verification
 
     if (updateError) throw updateError;
 
-    // 2. Add an audit log entry in your remarks table
+    if (!data || data.length === 0) {
+      return res.status(404).json({ error: "Admission record not found." });
+    }
+
+    // 2. Audit Trail
     await supabase.from('admission_remarks').insert([{
       admission_id: id,
-      remark_text: `CRITICAL STATUS CHANGE: STUDENT DROPPED OUT. Reason: ${dropout_reason || 'N/A'}`,
+      remark_text: `DROPOUT: Marked by Super Admin. Reason: ${dropout_reason || 'N/A'}`,
       created_by: userId
     }]);
 
     res.status(200).json({ 
-      message: 'Dropout processed successfully. Student is now excluded from active collection lists.',
-      id 
+      success: true,
+      message: 'Student moved to Dropout Registry.',
+      updated_record: data[0]
     });
   } catch (error) {
-    console.error('Dropout Logic Error:', error);
+    console.error('Dropout Process Error:', error);
     res.status(500).json({ error: "Failed to process dropout status." });
   }
 };
+
 
 exports.checkAdmissionByPhone = async (req, res) => {
   try {
@@ -367,6 +378,112 @@ exports.toggleUndertakingStatus = async (req, res) => {
     res.status(200).json({ message: `Undertaking marked as ${statusText}`, data });
   } catch (error) {
     console.error('Toggle Undertaking Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+/**
+ * @description Dedicated fetch for the Dropout Registry.
+ * Only returns students formally marked as dropouts.
+ */
+exports.getDropoutRegistry = async (req, res) => {
+  const { search = '', location_id, from, to } = req.query;
+  const userLocationId = req.locationId;
+  const isSuperAdmin = req.isSuperAdmin;
+
+  try {
+    let query = supabase
+      .from('v_admission_financial_summary')
+      .select('*')
+      .eq('is_dropout', true); // ✅ STRICT: Only formal dropouts
+
+    /* -------------------- 🛡️ BRANCH SECURITY -------------------- */
+    if (isSuperAdmin) {
+      // If super admin picks a specific branch
+      if (location_id && !['all', 'All', ''].includes(location_id)) {
+        query = query.eq('location_id', Number(location_id));
+      }
+    } else {
+      // Standard Admin: Strictly restricted to their own branch
+      if (!userLocationId) return res.status(401).json({ error: 'Location context missing.' });
+      query = query.eq('location_id', userLocationId);
+    }
+
+    /* -------------------- 📅 DATE FILTERING -------------------- */
+    // Use dropout_at for the registry view
+    if (from) {
+      query = query.gte('dropout_at', from);
+    }
+    
+    if (to) {
+      // ✅ FIX: Append end-of-day timestamp to include students who dropped out today
+      query = query.lte('dropout_at', `${to}T23:59:59.999Z`);
+    }
+
+    /* -------------------- 🔍 SEARCH LOGIC -------------------- */
+    if (search) {
+      // Note: Search term is applied within the already filtered results
+      query = query.or(`student_name.ilike.%${search}%,admission_number.ilike.%${search}%,student_phone_number.ilike.%${search}%`);
+    }
+
+    // Sort by most recent dropout first
+    const { data, error } = await query.order('dropout_at', { ascending: false });
+
+    if (error) throw error;
+
+    res.status(200).json({
+      success: true,
+      admissions: data || []
+    });
+    
+  } catch (error) {
+    console.error('Dropout Registry Fetch Error:', error);
+    res.status(500).json({ error: 'Internal server error while loading registry.' });
+  }
+};
+
+/**
+ * @description Reactivate a dropout student.
+ * Resets dropout flags and logs the action in remarks.
+ */
+// server/controllers/admissionController.js
+
+exports.reactivateStudent = async (req, res) => {
+  // ✅ FIX: Match the parameter name used in your routes file (which is 'id')
+  const { id } = req.params; 
+  const staffName = req.user?.username || 'System';
+
+  if (!id || id === 'undefined') {
+    return res.status(400).json({ error: 'Valid Admission ID is required.' });
+  }
+
+  try {
+    // 1. Update the admission record
+    const { data, error } = await supabase
+      .from('admissions')
+      .update({
+        is_dropout: false,
+        dropout_at: null,
+        dropout_reason: null,
+        joined: true,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id) // This was likely failing if 'id' was undefined
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    // 2. Add audit remark
+    await supabase.from('admission_remarks').insert({
+      admission_id: id,
+      remark_text: `RESTORED: Student reactivated from Dropout status by ${staffName}.`,
+      created_by: staffName
+    });
+
+    res.status(200).json({ success: true, data });
+  } catch (error) {
+    console.error('Reactivation Error:', error);
     res.status(500).json({ error: error.message });
   }
 };

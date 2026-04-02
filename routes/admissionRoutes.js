@@ -10,20 +10,32 @@ const {
   updateAdmission,
   checkAdmissionByPhone,
   toggleUndertakingStatus,
-  markStudentDropout, // ✅ NEW: Import the dropout controller
+  markStudentDropout,
+  reactivateStudent,
+  getDropoutRegistry,
 } = require('../controllers/admissionController');
 
-/* -------------------- UNDERTAKING LOOKUP (PUBLIC) -------------------- */
+/* -------------------- PUBLIC LOOKUP -------------------- */
 router.get('/by-phone/:phone', checkAdmissionByPhone);
 
-/* -------------------- ADMISSIONS (PROTECTED) -------------------- */
+/* -------------------- SPECIALIZED REGISTRIES -------------------- */
+// ✅ MUST stay above /:id routes so "dropout-registry" isn't treated as an ID
+router.get('/dropout-registry', auth, getDropoutRegistry);
+
+/* -------------------- CORE ADMISSIONS -------------------- */
 router.get('/', auth, getAllAdmissions);
 router.post('/', auth, createAdmission);
+
+/* -------------------- SPECIFIC RECORD ACTIONS -------------------- */
+// Dynamic routes (/:id) should always be at the bottom
 router.get('/:id', auth, getAdmissionById);
 router.put('/:id', auth, updateAdmission);
 
-// ✅ NEW: Route to mark a student as a Dropout
+// ✅ Reactivation & Dropout Actions
+router.put('/:id/reactivate', auth, reactivateStudent);
 router.put('/:id/dropout', auth, markStudentDropout);
+
+// ✅ Undertaking Toggle
 router.put('/:id/toggle-undertaking', auth, toggleUndertakingStatus);
 
 module.exports = router;

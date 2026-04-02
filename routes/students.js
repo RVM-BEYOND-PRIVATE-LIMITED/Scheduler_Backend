@@ -9,16 +9,23 @@ const {
     updateStudent, 
     deleteStudent,
     setDefaulterStatus,
-    getStudentBatches 
+    getStudentBatches,
+    transferStudentLocation // ✅ NEW: Import the transfer controller
 } = require('../controllers/studentsController');
 
-// --- Standard CRUD Routes ---
+/* -------------------- STANDARD CRUD -------------------- */
 router.get('/', auth, getAllStudents);
 router.post('/', auth, createStudent);
 router.put('/:id', auth, updateStudent);
 router.delete('/:id', auth, deleteStudent);
 
-// --- Defaulter Management Routes ---
+/* -------------------- ADMINISTRATIVE ACTIONS -------------------- */
+
+/**
+ * ✅ NEW: PUT /api/students/:id/transfer
+ * Transfers a student to a new location/branch
+ */
+router.put('/:id/transfer', auth, transferStudentLocation);
 
 /**
  * GET /api/students/:id/defaulter
@@ -27,14 +34,12 @@ router.delete('/:id', auth, deleteStudent);
 router.get('/:id/defaulter', auth, async (req, res) => {
     const rawId = req.params.id;
     
-    // 🕵️‍♂️ DEBUG LOGS - Check your terminal/console when you get the error
     console.log("-----------------------------------------");
     console.log("DEFAULTER GET REQUEST FOR ID:", `[${rawId}]`);
     console.log("ID STRING LENGTH:", rawId?.length); 
     console.log("-----------------------------------------");
 
     try {
-        // We use .trim() because hidden spaces in IDs are a common cause of 404s
         const cleanId = rawId.trim();
 
         const { data, error } = await supabase
@@ -51,7 +56,7 @@ router.get('/:id/defaulter', auth, async (req, res) => {
         if (!data) {
             return res.status(404).json({ 
                 error: "Student record not found",
-                details: `No record found for ID: ${cleanId}. Ensure this is the STUDENT UUID, not the ADMISSION UUID.` 
+                details: `No record found for ID: ${cleanId}. Ensure this is the STUDENT UUID.` 
             });
         }
 
@@ -80,7 +85,7 @@ router.post('/:id/remove-defaulter', auth, (req, res, next) => {
     next();
 }, setDefaulterStatus);
 
-// --- Batch Routes ---
+/* -------------------- BATCH MANAGEMENT -------------------- */
 router.get('/:id/batches', auth, getStudentBatches);
 
 module.exports = router;
