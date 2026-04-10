@@ -475,27 +475,38 @@ const getBatchStudents = async (req, res) => {
     // 5. Merge logic: Use View data if exists, otherwise fallback to Master Student data
     const processedStudents = studentsRes.data.map(s => {
       const adm = admissionMap.get(s.id);
-      
-      // If student is in the view, they are "Admitted"
-      // If not, they are "Pre-Admission"
       const isAdmitted = !!adm;
-      const balance = adm ? parseFloat(adm.balance_due || 0) : 0;
+      
+      // Pull the TRUE balance from the admission view (your CSV) or fallback to master
+      const balance = adm ? parseFloat(adm.balance_due || 0) : parseFloat(s.total_due_amount || 0);
+
+      // Override the stale "FULL PAID" master remark with the real financial status
+      let displayRemark = s.remarks || "No Remark";
+      if (isAdmitted) {
+          // If they owe money, force the remark to show the due amount.
+          displayRemark = balance > 0 ? `Due: ${balance}` : "FULL PAID";
+      }
 
       return {
         id: s.id,
         name: s.name,
         admission_number: s.admission_number || "PENDING",
         phone_number: s.phone_number || "N/A",
-        // ✅ Course Logic: View String > Batch Preference > Default
         enrolled_courses: adm?.courses_str || adm?.certificate_name || s.remarks || "No Course Linked",
         active_batches_count: batchCounts[s.id] || 1,
-        // ✅ Remark Logic: 
-        // If admitted: Show Paid/Due. 
-        // If not: Show student master remarks.
-        remarks: isAdmitted 
-          ? (balance <= 0 ? "FULL PAID" : `Due: ${balance}`) 
-          : (s.remarks || "Admission Pending"),
+        
+        // ✅ Feed the dynamically corrected remark to the frontend
+        remarks: displayRemark,
+        
+        // ✅ Pass the true balance so the frontend knows the actual amount due
+        total_due_amount: balance,
+
+        // Security flags
         is_defaulter: s.is_defaulter || false,
+        is_banned: s.is_banned || false,
+        is_suspended: s.is_suspended || false,
+        suspended_until: s.suspended_until || null,
+        
         next_follow_up: adm?.next_task_due_date || null,
         status_label: isAdmitted ? "Admitted" : "Trial/Pending"
       };

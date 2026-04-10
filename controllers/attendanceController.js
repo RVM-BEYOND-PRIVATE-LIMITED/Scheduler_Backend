@@ -178,23 +178,32 @@ const getBatchAttendanceReport = async (req, res) => {
   }
   
   try {
+    // 1. Fetch batch info and student links first
     const [
       { data: batchInfo, error: batchError },
       { data: studentLinks, error: studentError },
-      { data: attendanceRecords, error: attendanceError }
     ] = await Promise.all([
       supabase.from('batches').select('start_date, end_date, schedule').eq('id', batchId).single(),
       supabase.from('batch_students')
         .select(`
           student_id,
-          students:student_id (
-            *,
-            follow_up:v_follow_up_task_list (
-              total_due
-            )
-          )
+          students:student_id (*)
         `)
-        .eq('batch_id', batchId),
+        .eq('batch_id', batchId)
+    ]);
+
+    if (batchError) throw batchError;
+    if (studentError) throw studentError;
+
+    const studentIds = (studentLinks || []).map(link => link.student_id);
+
+    // 2. Fetch Follow-Up Task List AND attendance records
+    const [
+      { data: followUpData, error: followUpError },
+      { data: attendanceRecords, error: attendanceError }
+    ] = await Promise.all([
+      // ✅ Now using your new view: v_follow_up_task_list
+      supabase.from('v_follow_up_task_list').select('student_id, total_due, next_task_due_date').in('student_id', studentIds),
       supabase.from('student_attendance')
         .select('student_id, date, is_present')
         .eq('batch_id', batchId)
@@ -202,35 +211,40 @@ const getBatchAttendanceReport = async (req, res) => {
         .lte('date', endDate)
     ]);
 
-    if (batchError || studentError || attendanceError) throw (batchError || studentError || attendanceError);
+    if (followUpError) throw followUpError;
+    if (attendanceError) throw attendanceError;
 
-    // --- AUTOMATIC SYNC LOGIC (RVM ONLY) ---
-    const updatePromises = [];
+    // 3. Create a quick lookup map for follow-up data
+    const followUpMap = new Map((followUpData || []).map(item => [item.student_id, item]));
 
-    const processedStudents = studentLinks.map(link => {
+    const processedStudents = (studentLinks || []).map(link => {
       const student = link.students;
       if (!student) return null;
 
-      const totalDue = Number(student.follow_up?.[0]?.total_due || 0);
-      let currentRemarks = student.remarks || '';
       const admissionNo = (student.admission_number || "").trim();
+      
+      // Pull true balance from the follow-up view
+      const taskRecord = followUpMap.get(student.id);
+      const balance = taskRecord ? parseFloat(taskRecord.total_due || 0) : parseFloat(student.total_due_amount || 0);
 
-      /**
-       * ✅ CONDITIONAL SYNC GUARD
-       * We ONLY auto-update to "FULL PAID" if:
-       * 1. The ID starts with RVM- (Modern System)
-       * 2. The Total Due is 0 or less
-       * 3. The current remark isn't already 'FULL PAID'
-       */
-      if (admissionNo.startsWith('RVM-') && totalDue <= 0 && !/full\s*paid/i.test(currentRemarks)) {
-        currentRemarks = "FULL PAID";
-        
-        updatePromises.push(
-          supabase
-            .from('students')
-            .update({ remarks: "FULL PAID", updated_at: new Date().toISOString() })
-            .eq('id', student.id)
-        );
+      // ✅ Dynamically assign the Remark to be the Next Task Due Date
+      let displayRemark = student.remarks || "No Remark";
+      
+      if (balance <= 0) {
+          // If they owe nothing, it's safer to override and say Paid
+          displayRemark = "FULL PAID";
+      } else if (taskRecord && taskRecord.next_task_due_date) {
+          // Parse and format the SQL date (e.g., "2026-04-09") into something readable for the UI
+          const d = new Date(taskRecord.next_task_due_date);
+          if (!isNaN(d.getTime())) {
+            displayRemark = `${String(d.getDate()).padStart(2, '0')} ${d.toLocaleString('en-GB', { month: 'short' })} ${d.getFullYear()}`;
+          } else {
+            // Fallback to raw string if JS Date parsing fails
+            displayRemark = taskRecord.next_task_due_date; 
+          }
+      } else if (balance > 0) {
+          // Edge Case: They owe money, but no follow-up task exists
+          displayRemark = "Date Pending";
       }
 
       return {
@@ -238,19 +252,17 @@ const getBatchAttendanceReport = async (req, res) => {
         name: student.name?.trim() || 'Unknown',
         admission_number: admissionNo,
         phone_number: (student.phone_number || '').trim(),
-        remarks: currentRemarks, // Will be "FULL PAID" for RVM students, or original date/remark for legacy
-        total_due_amount: totalDue,
+        
+        // 👇 Here is the updated remark containing the due date!
+        remarks: displayRemark, 
+        
+        total_due_amount: balance,
         is_defaulter: !!student.is_defaulter,
         is_banned: !!student.is_banned,
         is_suspended: !!student.is_suspended,
         suspended_until: student.suspended_until
       };
     }).filter(Boolean);
-
-    // Execute RVM updates in background
-    if (updatePromises.length > 0) {
-      Promise.all(updatePromises).catch(err => console.error("RVM Auto-remark error:", err));
-    }
 
     /* -------------------------------------------------------------------------- */
     /* 1. Generate strictly valid schedule dates                                  */
@@ -295,7 +307,6 @@ const getBatchAttendanceReport = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
-
 const getFacultyAttendanceReport = async (req, res) => {
   const { facultyId } = req.params;
   const { startDate, endDate, location_id } = req.query; 
