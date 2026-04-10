@@ -49,7 +49,7 @@ exports.getAdmissionsForAccounts = async (req, res) => {
       query = query.eq('location_id', userLocationId);
     }
 
-    if (status && status !== 'All') query.eq('approval_status', status);
+    if (status && status !== 'All') query = query.eq('approval_status', status);
     if (search) {
       query = query.or(`student_name.ilike.%${search}%,student_phone_number.ilike.%${search}%,admission_number.ilike.%${search}%`);
     }
@@ -364,10 +364,53 @@ exports.getAccountDetails = async (req, res) => {
       installments: (installmentsResult.data || []).map(i => ({ id: i.id, due_date: i.due_date, amount: i.amount_due, status: i.status })),
       payments: paymentsWithStaff,
       courses: (coursesResult.data || []).map(c => c.courses?.name).filter(Boolean),
-      documents: [...new Set(idCardUrls)]
+      documents: [...new Set(idCardUrls)],
+      remarks: admission.admission_remarks || ''
     });
   } catch (error) {
     console.error(`Error fetching account details:`, error);
+    res.status(500).json({ error: 'An unexpected server error occurred.' });
+  }
+};
+
+/**
+ * @description Update admission remarks (add/edit).
+ */
+exports.updateAdmissionRemarks = async (req, res) => {
+  const { admissionId } = req.params;
+  const { remarks } = req.body;
+  const locationId = req.locationId;
+  const isSuperAdmin = req.isSuperAdmin;
+
+  if (remarks === undefined) {
+    return res.status(400).json({ error: 'Remarks field is required.' });
+  }
+
+  try {
+    const { data: admission, error: fetchError } = await supabase
+      .from('admissions')
+      .select('id, location_id')
+      .eq('id', admissionId)
+      .single();
+
+    if (fetchError || !admission) {
+      return res.status(404).json({ error: 'Admission not found.' });
+    }
+
+    if (!isSuperAdmin && Number(admission.location_id) !== Number(locationId)) {
+      return res.status(403).json({ error: 'Access denied: Branch mismatch.' });
+    }
+
+    const { error: updateError } = await supabase
+      .from('admissions')
+      .update({ admission_remarks: remarks.trim(), updated_at: new Date().toISOString() })
+      .eq('id', admissionId);
+
+    if (updateError) throw updateError;
+
+    res.status(200).json({ message: 'Remarks updated successfully.', remarks: remarks.trim() });
+  } catch (error) {
+    console.error(`Error updating remarks for admission ${admissionId}:`, error);
     res.status(500).json({ error: 'An unexpected server error occurred.' });
   }
 };
@@ -392,8 +435,7 @@ exports.getReceiptData = async (req, res) => {
           id, date_of_admission, gst_rate, is_gst_exempt, total_payable_amount,
           father_name, current_address, location_id,
           students ( name, phone_number, admission_number, batch_students ( batches ( name ) ) ),
-          admission_courses ( courses ( name, price ) ),
-          installments!installments_admission_id_fkey ( id, due_date, amount, status )
+          admission_courses ( courses ( name, price ) )
         )
       `)
       .eq('id', paymentId)
@@ -411,19 +453,28 @@ exports.getReceiptData = async (req, res) => {
       return res.status(403).json({ error: 'Access denied: Branch mismatch.' });
     }
 
+    // ✅ FIX: Fetch installments from v_installment_status (live computed view) instead of
+    // the raw installments table. The raw table's 'status' column can be stale if
+    // update_admission_full recreated installments after payments were recorded.
+    // v_installment_status always derives status from cumulative payment totals.
+    const { data: liveInstallments } = await supabase
+      .from('v_installment_status')
+      .select('id, due_date, amount_due, status')
+      .eq('admission_id', admissionData.id)
+      .order('due_date', { ascending: true });
+
+    const installments = liveInstallments || [];
+
     // --- Next Due Prediction Logic ---
-    const nextInst = (admissionData.installments || [])
-      .filter(i => i.status !== 'Paid')
-      .sort((a, b) => new Date(a.due_date).getTime() - new Date(b.due_date).getTime())[0];
+    const nextInst = installments
+      .filter(i => i.status !== 'Paid')[0]; // already sorted by due_date
 
     // --- Installment Schedule for Receipt Table ---
-    const installmentSchedule = (admissionData.installments || [])
-      .map(inst => ({
-        due_date: inst.due_date,
-        amount: inst.amount,
-        status: inst.status
-      }))
-      .sort((a, b) => new Date(a.due_date).getTime() - new Date(b.due_date).getTime());
+    const installmentSchedule = installments.map(inst => ({
+      due_date: inst.due_date,
+      amount: inst.amount_due,
+      status: inst.status,
+    }));
 
     const batchString = studentData?.batch_students?.map(bs => bs.batches?.name).filter(Boolean).join(', ') || 'Not Allotted';
 
@@ -463,7 +514,7 @@ exports.getReceiptData = async (req, res) => {
       
       prediction: {
         next_due_date: nextInst ? nextInst.due_date : null,
-        next_due_amount: nextInst ? nextInst.amount : 0,
+        next_due_amount: nextInst ? nextInst.amount_due : 0,
         is_fully_paid: !nextInst
       }
     };

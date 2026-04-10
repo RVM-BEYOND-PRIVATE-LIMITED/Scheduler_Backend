@@ -6,9 +6,10 @@ const {
   approveAdmission,
   rejectAdmission,
   recordPayment,
-  getAccountDetails, 
+  getAccountDetails,
   uploadAdmissionDocuments,
-  getReceiptData
+  getReceiptData,
+  updateAdmissionRemarks
 } = require('../controllers/accountsController');
 const auth = require('../middleware/auth');
 
@@ -32,5 +33,8 @@ router.post('/payments', auth, recordPayment);
 router.get('/payments/:paymentId/receipt', auth, getReceiptData);
 
 router.post('/admissions/:admissionId/upload-docs', auth, uploadAdmissionDocuments);
+
+// PATCH /api/accounts/admissions/:admissionId/remarks
+router.patch('/admissions/:admissionId/remarks', auth, updateAdmissionRemarks);
 
 module.exports = router;

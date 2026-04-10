@@ -249,12 +249,29 @@ exports.updateAdmission = async (req, res) => {
       p_certificate_id: (certificate_id && certificate_id !== 'null' && certificate_id.length > 20) ? certificate_id : null,
       p_discount: Number(discount) || 0,
       p_course_ids: Array.isArray(course_ids) ? course_ids : [],
-      p_installments: Array.isArray(installments) ? installments : [], 
-      p_location_id: finalLocationId, 
+      p_installments: Array.isArray(installments) ? installments : [],
+      p_location_id: finalLocationId,
       p_updated_by: userId
     });
 
     if (error) throw error;
+
+    // ✅ FIX: Re-sync installment paid statuses after update.
+    // update_admission_full deletes and recreates all installments as 'Pending'.
+    // Re-running apply_payment_to_installments restores correct statuses
+    // based on the student's actual payment history (FIFO logic).
+    const { data: latestPayment } = await supabase
+      .from('payments')
+      .select('id')
+      .eq('admission_id', id)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (latestPayment) {
+      await supabase.rpc('apply_payment_to_installments', { p_payment_id: latestPayment.id });
+    }
+
     res.status(200).json({ message: 'Admission updated successfully' });
 
   } catch (error) {
