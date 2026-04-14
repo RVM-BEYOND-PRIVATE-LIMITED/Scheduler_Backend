@@ -307,6 +307,8 @@ const getBatchAttendanceReport = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
+
+
 const getFacultyAttendanceReport = async (req, res) => {
   const { facultyId } = req.params;
   const { startDate, endDate, location_id } = req.query; 
