@@ -157,8 +157,11 @@ exports.createAdmission = async (req, res) => {
     certificate_id, discount, course_ids, installments, source_intake_id,
   } = req.body;
 
-  const locationId = req.locationId;
+  const tokenLocationId = req.locationId;
   const userId = req.user?.id;
+
+  // Allow any admin to admit a student to a chosen branch; fall back to their own branch.
+  const locationId = req.body.location_id || tokenLocationId;
 
   if (!locationId || !userId) {
     return res.status(401).json({ error: 'Authentication failed.' });
@@ -187,10 +190,10 @@ exports.createAdmission = async (req, res) => {
         p_certificate_id: (certificate_id && certificate_id !== 'null') ? certificate_id : null,
         p_discount: Number(discount) || 0,
         p_course_ids: course_ids,
-        p_installments: installments, 
+        p_installments: installments,
         p_location_id: locationId,
         p_admitted_by: userId,
-        p_source_intake_id: source_intake_id || null, 
+        p_source_intake_id: source_intake_id || null,
       }
     );
 
@@ -222,12 +225,13 @@ exports.updateAdmission = async (req, res) => {
     certificate_id, discount, course_ids, installments
   } = req.body;
 
-  const locationId = req.locationId; 
+  const tokenLocationId = req.locationId;
   const userId = req.user?.id;
 
-  try {
-    const finalLocationId = locationId ? String(locationId) : null;
+  // Allow any admin to reassign an admission to a chosen branch; fall back to their own branch.
+  const finalLocationId = String(req.body.location_id || tokenLocationId || '');
 
+  try {
     if (!finalLocationId) {
        return res.status(400).json({ error: "Location identification is missing." });
     }
